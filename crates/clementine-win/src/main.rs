@@ -4,6 +4,7 @@ mod hook;
 mod install;
 mod renderer;
 mod shelf;
+mod showcase;
 
 use clementine_core::*;
 use drop_target::*;
@@ -29,11 +30,23 @@ const TIMER_ID: usize = 1;
 const TIMER_CLOSE_ID: usize = 2;
 const TIMER_DEMO_ID: usize = 3;
 const TIMER_TOUR_ID: usize = 4;
+const TIMER_PROGRESS_ID: usize = 5;
+const PROGRESS_MS: f64 = 520.0;
+const HOLD_MS: f64 = 320.0;
 const WM_APP_TRAY: u32 = WM_APP + 20;
 const BLOOM_MS: f64 = 200.0;
 const S: i32 = SIZE as i32;
 
+struct Progress {
+    title: String,
+    name: String,
+    saved: String,
+    t0: Instant,
+    demo: bool,
+}
+
 struct Wheel {
+    progress: Option<Progress>,
     open: bool,
     demo_until: Option<Instant>,
     mode: WheelMode,
@@ -189,6 +202,7 @@ fn open_wheel(hwnd: HWND, mode: WheelMode, demo: bool) {
             }
             w.cx = pt.x;
             w.cy = pt.y;
+            w.progress = None;
             w.base = make_base(capture_screen(pt.x, pt.y).as_deref());
             w.t0 = Instant::now();
             w.open = true;
@@ -204,6 +218,7 @@ fn open_wheel(hwnd: HWND, mode: WheelMode, demo: bool) {
             SetWindowPos(hwnd, HWND_TOPMOST, cx - 136, cy - 136, S, S, SWP_NOACTIVATE);
             present_hwnd(hwnd);
             ShowWindow(hwnd, SW_SHOWNA);
+            KillTimer(hwnd, TIMER_PROGRESS_ID);
             SetTimer(hwnd, TIMER_ID, 16, None);
             // Nudge so an in-flight DoDragDrop fires DragEnter without waiting for real movement.
             SetCursorPos(pt.x + 1, pt.y);
@@ -218,6 +233,7 @@ fn close_wheel(hwnd: HWND) {
     W.with(|c| {
         if let Some(w) = c.borrow_mut().as_mut() {
             w.open = false;
+            w.progress = None;
             w.paths.clear();
         }
     });
@@ -225,6 +241,7 @@ fn close_wheel(hwnd: HWND) {
         KillTimer(hwnd, TIMER_ID);
         KillTimer(hwnd, TIMER_CLOSE_ID);
         KillTimer(hwnd, TIMER_DEMO_ID);
+        KillTimer(hwnd, TIMER_PROGRESS_ID);
         ShowWindow(hwnd, SW_HIDE);
     }
 }
@@ -258,30 +275,115 @@ fn commit(hwnd: HWND) {
         Some((w.mode, w.ids[i].clone(), w.paths.clone()))
     });
     let demo = W.with(|c| c.borrow().as_ref().is_some_and(|w| w.demo_until.is_some()));
-    close_wheel(hwnd);
-    let Some((mode, id, paths)) = job else { return };
+    let quit = || {
+        if demo {
+            unsafe { PostQuitMessage(0) };
+        }
+    };
+    let Some((mode, id, paths)) = job else { return close_wheel(hwnd) };
     if paths.is_empty() {
+        close_wheel(hwnd);
         println!("selected {id} (no files)");
         return;
     }
+    let mut outs = vec![];
     match mode {
+        WheelMode::Actions => {
+            close_wheel(hwnd);
+            actions::run(hwnd, &id, &paths);
+            return quit();
+        }
         WheelMode::Conversions => {
             for p in &paths {
                 match execute_conversion(p, &id) {
-                    Ok(o) => println!("wrote {}", o.display()),
+                    Ok(o) => {
+                        println!("wrote {}", o.display());
+                        outs.push(o);
+                    }
                     Err(e) => eprintln!("convert failed: {e}"),
                 }
             }
         }
         WheelMode::Tools => match execute_tool(&paths, &id, &ToolParams::default()) {
-            Ok(o) => println!("wrote {}", o.display()),
+            Ok(o) => {
+                println!("wrote {}", o.display());
+                outs.push(o);
+            }
             Err(e) => eprintln!("tool failed: {e}"),
         },
-        WheelMode::Actions => actions::run(hwnd, &id, &paths),
     }
-    if demo {
-        unsafe { PostQuitMessage(0) };
+    let Some(last) = outs.last() else {
+        close_wheel(hwnd);
+        return quit();
+    };
+    let name = last.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let (title, saved) = match (mode, id.as_str()) {
+        (WheelMode::Tools, "removeMetadata") => ("STRIPPING METADATA".to_string(), "Removed EXIF & GPS tags".to_string()),
+        (WheelMode::Tools, "compress") => ("COMPRESSING FILE".to_string(), format!("Saved {name}")),
+        (WheelMode::Tools, _) => {
+            let t = tool_meta(&id).map(|t| t.title.to_ascii_uppercase()).unwrap_or_else(|| id.to_ascii_uppercase());
+            (format!("RUNNING {t}"), format!("Saved {name}"))
+        }
+        _ => (format!("CONVERTING TO {}", id.to_ascii_uppercase()), format!("Saved {name}")),
+    };
+    start_progress(hwnd, Progress { title, name, saved, t0: Instant::now(), demo });
+}
+
+fn present_frame(hwnd: HWND, cx: i32, cy: i32, frame: &[u32]) {
+    let mut d = Dib::new();
+    d.slice().copy_from_slice(frame);
+    unsafe {
+        let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
+        let pt = POINT { x: cx - 136, y: cy - 136 };
+        let sz = SIZE { cx: S, cy: S };
+        let src = POINT { x: 0, y: 0 };
+        UpdateLayeredWindow(hwnd, std::ptr::null_mut(), &pt, &sz, d.dc, &src, 0, &blend, ULW_ALPHA);
     }
+}
+
+/// Swaps the wheel for the progress HUD; `progress_tick` animates it and finally closes the window.
+fn start_progress(hwnd: HWND, p: Progress) {
+    W.with(|c| {
+        if let Some(w) = c.borrow_mut().as_mut() {
+            w.open = false;
+            w.selected = None;
+            w.paths.clear();
+            w.progress = Some(p);
+        }
+    });
+    unsafe {
+        KillTimer(hwnd, TIMER_ID);
+        KillTimer(hwnd, TIMER_CLOSE_ID);
+        KillTimer(hwnd, TIMER_DEMO_ID);
+        SetTimer(hwnd, TIMER_PROGRESS_ID, 16, None);
+    }
+    progress_tick(hwnd);
+}
+
+fn progress_tick(hwnd: HWND) {
+    let out = W.with(|c| {
+        let g = c.borrow();
+        let w = g.as_ref()?;
+        let p = w.progress.as_ref()?;
+        let ms = p.t0.elapsed().as_secs_f64() * 1000.0;
+        if ms >= PROGRESS_MS + HOLD_MS {
+            return Some((vec![], 0, 0, true, p.demo));
+        }
+        let t = (ms / PROGRESS_MS).min(1.0);
+        let done = ms >= PROGRESS_MS;
+        let sub = if done { p.saved.clone() } else { format!("{}  \u{b7}  {}%", p.name, (t * 100.0) as u32) };
+        let e = (t * t * (3.0 - 2.0 * t)) as f32;
+        Some((render_progress_hud(&w.base, &p.title, &sub, e, done), w.cx, w.cy, false, p.demo))
+    });
+    let Some((frame, cx, cy, finished, demo)) = out else { return };
+    if finished {
+        close_wheel(hwnd);
+        if demo {
+            unsafe { PostQuitMessage(0) };
+        }
+        return;
+    }
+    present_frame(hwnd, cx, cy, &frame);
 }
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -353,6 +455,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM) -
         }
         WM_TIMER if wp == TIMER_DEMO_ID => {
             close_wheel(hwnd);
+            0
+        }
+        WM_TIMER if wp == TIMER_PROGRESS_ID => {
+            progress_tick(hwnd);
             0
         }
         WM_TIMER if wp == TIMER_TOUR_ID => {
@@ -443,6 +549,7 @@ fn create_window() -> HWND {
         OleInitialize(std::ptr::null());
         W.with(|c| {
             *c.borrow_mut() = Some(Wheel {
+                progress: None,
                 open: false,
                 demo_until: None,
                 mode: WheelMode::Conversions,
@@ -719,6 +826,11 @@ fn self_test() -> std::result::Result<(), String> {
     if mb >= 15.0 {
         return Err(format!("working set {mb:.2} MB >= 15 MB"));
     }
+    let hud = render_progress_hud(&make_base(Some(&synthetic_backdrop())), "CONVERTING TO WEBP", "photo No Metadata.jpg  \u{b7}  78%", 0.78, false);
+    to_image(&hud).save("target/test-progress-hud.png").map_err(|e| e.to_string())?;
+    if hud[156 * SIZE + 60] >> 24 == 0 {
+        return Err("progress HUD bar missing".into());
+    }
     println!("self-test ok: target/self-test-wheel.png");
     Ok(())
 }
@@ -738,6 +850,13 @@ fn main() {
             let sel = a.get(5).and_then(|s| s.parse().ok());
             let px = render_state(parse_mode(a.get(3)), ext, sel, "2.2 MB");
             to_image(&px).save(out).expect("save png");
+        }
+        Some("--render-showcase") => {
+            let out = a.get(2).expect("usage: --render-showcase <out_dir>");
+            if let Err(e) = showcase::render_showcase_frames(Path::new(out)) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
         }
         Some("--convert") => {
             let (Some(p), Some(t)) = (a.get(2), a.get(3)) else { return eprintln!("usage: --convert <input_path> <target_ext>") };

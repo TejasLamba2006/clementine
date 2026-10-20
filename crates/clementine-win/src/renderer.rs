@@ -352,7 +352,7 @@ fn icon_shapes(id: &str) -> Vec<Sh> {
     }
 }
 
-fn seg_dist(px: f32, py: f32, a: f32, b: f32, c: f32, d: f32) -> f32 {
+pub fn seg_dist(px: f32, py: f32, a: f32, b: f32, c: f32, d: f32) -> f32 {
     let (vx, vy) = (c - a, d - b);
     let l = (vx * vx + vy * vy).max(1e-6);
     let t = (((px - a) * vx + (py - b) * vy) / l).clamp(0.0, 1.0);
@@ -388,7 +388,7 @@ fn draw_icon(buf: &mut [Px], id: &str, cx: f64, cy: f64, col: [f32; 3]) {
     }
 }
 
-fn rounded_box_sdf(x: f64, y: f64, hw: f64, hh: f64, r: f64) -> f64 {
+pub fn rounded_box_sdf(x: f64, y: f64, hw: f64, hh: f64, r: f64) -> f64 {
     let (qx, qy) = (x.abs() - (hw - r), y.abs() - (hh - r));
     qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - r
 }
@@ -504,6 +504,156 @@ pub fn synthetic_backdrop() -> Vec<u32> {
         .map(|i| {
             let (x, y) = ((i % SIZE) as u32, (i / SIZE) as u32);
             0xFF00_0000 | ((40 + x / 2) << 16) | ((90 + y / 3) << 8) | (180 - x / 3)
+        })
+        .collect()
+}
+
+pub struct Mask {
+    pub w: usize,
+    pub h: usize,
+    pub a: Vec<f32>,
+}
+
+/// GDI text at 3x, box-averaged into a tight coverage mask (1px padding).
+pub fn text_mask(text: &str, px: i32, weight: i32, face: &str) -> Mask {
+    unsafe {
+        let ss = SS as usize;
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        let face16: Vec<u16> = face.encode_utf16().chain(Some(0)).collect();
+        let font = CreateFontW(
+            -px * SS, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET as u32, OUT_DEFAULT_PRECIS as u32,
+            CLIP_DEFAULT_PRECIS as u32, ANTIALIASED_QUALITY as u32,
+            (DEFAULT_PITCH | FF_DONTCARE) as u32, face16.as_ptr(),
+        );
+        let probe = Dib::sized(1, 1);
+        let old = SelectObject(probe.dc, font);
+        let mut sz: windows_sys::Win32::Foundation::SIZE = std::mem::zeroed();
+        GetTextExtentPoint32W(probe.dc, wide.as_ptr(), wide.len() as i32, &mut sz);
+        SelectObject(probe.dc, old);
+        let (w, h) = (sz.cx as usize / ss + 3, sz.cy as usize / ss + 3);
+        let dib = Dib::sized(w * ss, h * ss);
+        let old = SelectObject(dib.dc, font);
+        std::ptr::write_bytes(dib.bits, 0, w * h * ss * ss);
+        SetBkMode(dib.dc, TRANSPARENT as i32);
+        SetTextColor(dib.dc, 0x00FF_FFFF);
+        TextOutW(dib.dc, SS, SS, wide.as_ptr(), wide.len() as i32);
+        GdiFlush();
+        SelectObject(dib.dc, old);
+        DeleteObject(font);
+        let px = std::slice::from_raw_parts(dib.bits, w * h * ss * ss);
+        let mut a = vec![0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let mut sum = 0u32;
+                for dy in 0..ss {
+                    for dx in 0..ss {
+                        sum += (px[(y * ss + dy) * w * ss + x * ss + dx] >> 8) & 255;
+                    }
+                }
+                a[y * w + x] = sum as f32 / (255.0 * (ss * ss) as f32);
+            }
+        }
+        Mask { w, h, a }
+    }
+}
+
+pub fn fit_mask(text: &str, mut px: i32, weight: i32, maxw: usize) -> Mask {
+    loop {
+        let m = text_mask(text, px, weight, "Segoe UI");
+        if m.w <= maxw || px <= 7 {
+            return m;
+        }
+        px -= 1;
+    }
+}
+
+/// Blends a mask centered at `(cx, cy)` into a buffer of `bw` x `bh` premultiplied pixels.
+pub fn blit_mask_sized(buf: &mut [Px], bw: usize, bh: usize, m: &Mask, cx: f64, cy: f64, col: [f32; 3]) {
+    let (ox, oy) = ((cx - m.w as f64 / 2.0).round() as i32, (cy - m.h as f64 / 2.0).round() as i32);
+    for y in 0..m.h {
+        for x in 0..m.w {
+            let (gx, gy) = (ox + x as i32, oy + y as i32);
+            let a = m.a[y * m.w + x];
+            if a > 0.0 && gx >= 0 && gy >= 0 && gx < bw as i32 && gy < bh as i32 {
+                over(&mut buf[gy as usize * bw + gx as usize], col, a);
+            }
+        }
+    }
+}
+
+/// Frosted-glass progress card (244x86) with animated #FF5200 bar. Premultiplied BGRA like `render`.
+pub fn render_progress_hud(base: &[Px], title: &str, subtitle: &str, progress: f32, done: bool) -> Vec<u32> {
+    let (mut avg, mut n) = ([0f32; 3], 0f32);
+    for p in base.iter().filter(|p| p[3] > 0.99) {
+        for i in 0..3 {
+            avg[i] += p[i];
+        }
+        n += 1.0;
+    }
+    let avg = if n > 0.0 { avg.map(|v| v / n) } else { [0.78, 0.80, 0.82] };
+    let mut buf = vec![[0f32; 4]; N];
+    let (hw, hh, r) = (122.0, 43.0, 22.0);
+    let orange = rgb8(255, 82, 0);
+    let green = rgb8(30, 174, 91);
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let (px, py) = (x as f64 + 0.5 - C, y as f64 + 0.5 - C);
+            let i = y * SIZE + x;
+            let t = ((10.0 - rounded_box_sdf(px, py - 6.0, hw, hh, r)) / 20.0).clamp(0.0, 1.0) as f32;
+            over(&mut buf[i], rgb8(38, 52, 56), t * t * (3.0 - 2.0 * t) * 0.22);
+            let d = rounded_box_sdf(px, py, hw, hh, r);
+            let c = (0.5 - d).clamp(0.0, 1.0) as f32;
+            if c > 0.0 {
+                let b = base.get(i).copied().unwrap_or([0.0; 4]);
+                let bd = if b[3] > 0.5 { [b[0] / b[3], b[1] / b[3], b[2] / b[3]] } else { avg };
+                over(&mut buf[i], bd, c);
+                over(&mut buf[i], rgb8(255, 252, 249), 0.90 * c);
+                let inner = (0.5 - (d + 1.5)).clamp(0.0, 1.0) as f32;
+                over(&mut buf[i], [1.0; 3], 0.92 * (c - inner).max(0.0));
+            }
+            let (ax, ay) = (x as f64 + 0.5, y as f64 + 0.5);
+            let bc = if done { green } else { orange };
+            let dist = (ax - 34.0).hypot(ay - 114.0);
+            let glow = ((1.0 - (dist - 9.0) / 9.0).clamp(0.0, 1.0) as f32).powi(2) * 0.35;
+            if dist > 8.0 {
+                over(&mut buf[i], bc, glow);
+            }
+            over(&mut buf[i], bc, (9.5 - dist).clamp(0.0, 1.0) as f32);
+            if done {
+                let d = seg_dist(ax as f32, ay as f32, 30.0, 114.0, 33.0, 117.2)
+                    .min(seg_dist(ax as f32, ay as f32, 33.0, 117.2, 38.2, 111.0));
+                over(&mut buf[i], [1.0; 3], (1.8 - d).clamp(0.0, 1.0));
+            } else {
+                over(&mut buf[i], [1.0; 3], (3.0 - dist as f32).clamp(0.0, 1.0));
+            }
+            if (145..168).contains(&y) && (28..244).contains(&x) {
+                let td = rounded_box_sdf(ax - 136.0, ay - 156.0, 100.0, 4.0, 4.0);
+                over(&mut buf[i], rgb8(40, 43, 41), 0.12 * (0.5 - td).clamp(0.0, 1.0) as f32);
+                let fw = 200.0 * progress.clamp(0.05, 1.0) as f64;
+                let fd = rounded_box_sdf(ax - (36.0 + fw / 2.0), ay - 156.0, fw / 2.0, 4.0, 4.0);
+                if fd > 0.0 {
+                    over(&mut buf[i], orange, 0.30 * ((1.0 - fd / 7.0).clamp(0.0, 1.0) as f32).powi(2));
+                }
+                let fc = (0.5 - fd).clamp(0.0, 1.0) as f32;
+                if fc > 0.0 {
+                    let k = ((ax - 36.0) / fw).clamp(0.0, 1.0) as f32;
+                    let col = [255.0, 82.0 + 54.0 * k, 56.0 * k].map(|v| v / 255.0);
+                    over(&mut buf[i], col, fc);
+                    let s = (0.5 + 0.5 * ((ax + ay * 0.9) as f32 * 0.16 - progress * 24.0).sin()).powi(6);
+                    over(&mut buf[i], [1.0; 3], 0.38 * s * fc);
+                    if ay < 154.0 {
+                        over(&mut buf[i], [1.0; 3], 0.18 * fc);
+                    }
+                }
+            }
+        }
+    }
+    blit_mask_sized(&mut buf, SIZE, SIZE, &fit_mask(title, 12, 700, 190), C, 114.0, rgb8(30, 32, 31));
+    blit_mask_sized(&mut buf, SIZE, SIZE, &fit_mask(subtitle, 10, 400, 196), C, 134.0, rgb8(98, 104, 98));
+    buf.iter()
+        .map(|p| {
+            let q = |v: f32| (v * 255.0).round().clamp(0.0, 255.0) as u32;
+            (q(p[3]) << 24) | (q(p[0]) << 16) | (q(p[1]) << 8) | q(p[2])
         })
         .collect()
 }
