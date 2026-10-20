@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#ffffff" />
+    <meta name="description" content="Clementine is a Windows app for converting files: drag a file, then tap Shift to convert, Alt for file tools, or Control for file actions. Everything runs locally." />
+    <title>Clementine | The zero-click offline file converter for Windows</title>
+    <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+    <link rel="preload" as="image" href="images/tree-sky.jpg" />
+    <link rel="stylesheet" href="assets/style.css" />
+    <script defer src="assets/home.js"></script>
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="wordmark" href="index.html" aria-label="Clementine home"><span class="brand-mark" aria-hidden="true"></span>Clementine</a>
+      <nav aria-label="Main navigation">
+        <a class="quiet-link" href="#details">Features</a>
+        <a href="https://github.com/TejasLamba2006/clementine/releases" class="win-download-btn" aria-label="Download Clementine for Windows"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5.5 10.5 4.5v7H3zM11.5 4.4 21 3v8.5h-9.5zM3 12.5h7.5v7L3 18.5zM11.5 12.5H21V21l-9.5-1.4z"/></svg>Download for Windows</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="app-demo content-width" aria-label="Clementine video demo">
+        <video autoplay muted loop playsinline disablepictureinpicture disableremoteplayback preload="auto" aria-label="Watch Clementine in action">
+          <source src="videos/tangerine-landing-demo.mp4" type="video/mp4" />
+          <a href="videos/tangerine-landing-demo.mp4">Download the Clementine demo video</a>
+        </video>
+      </section>
+
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <h1 id="hero-title">The zero-click<br />offline file converter.</h1>
+          <p class="hero-description">Drag a file, tap Shift, and drop. Turn files into the formats you need without breaking your flow.</p>
+          <p class="hero-local">Everything happens locally on your PC.</p>
+        </div>
+
+        <div class="scene" id="playground" aria-label="Interactive file conversion demo">
+          <div class="landscape" aria-hidden="true"><img src="images/tree-sky.jpg" alt="" width="1536" height="1024" fetchpriority="high" draggable="false" /></div>
+          <div class="scene-top-fade" aria-hidden="true"></div>
+          <div class="scene-bottom-fade" aria-hidden="true"></div>
+          <div class="hint-wrap">
+            <div class="gesture-hint" id="gesture-hint" role="status" aria-live="polite">
+              <span id="hint-text">Drag this file</span>
+              <svg class="hint-arrow" width="180" height="135" viewBox="0 0 180 135" aria-hidden="true"><path d="M133 10C140 45 76 71 22 94M22 94L29 79M22 94L39 94" /></svg>
+            </div>
+          </div>
+          <div class="files" id="files"></div>
+        </div>
+      </section>
+
+      <section class="tool-stats content-width" aria-label="Conversion and editing tools">
+        <div class="tool-stat">
+          <strong>275</strong>
+          <h2>Conversion options</h2>
+          <p>Across images, video, audio, documents, spreadsheets, and archives.</p>
+        </div>
+        <div class="tool-stat">
+          <strong>26</strong>
+          <h2>Advanced file tools</h2>
+          <p>Compress, crop, trim, split, merge, and more.</p>
+        </div>
+        <div class="tool-stat">
+          <strong>6</strong>
+          <h2>File actions</h2>
+          <p>Nearby Share, Float, Copy, Move, Copy Path, and Terminal.</p>
+        </div>
+      </section>
+
+      <section class="details content-width" id="details" aria-labelledby="details-title">
+        <div class="bento-tabs" role="tablist" aria-label="File type">
+          <button id="file-tab-jpg" type="button" role="tab" data-demo-file="jpg" aria-selected="true" aria-controls="bento-panel" tabindex="0"><img src="icons/categories/images.svg" alt="" />Images</button>
+          <button id="file-tab-mov" type="button" role="tab" data-demo-file="mov" aria-selected="false" aria-controls="bento-panel" tabindex="-1"><img src="icons/categories/video.svg" alt="" />Video</button>
+          <button id="file-tab-mp3" type="button" role="tab" data-demo-file="mp3" aria-selected="false" aria-controls="bento-panel" tabindex="-1"><img src="icons/categories/audio.svg" alt="" />Audio</button>
+          <button id="file-tab-pdf" type="button" role="tab" data-demo-file="pdf" aria-selected="false" aria-controls="bento-panel" tabindex="-1"><img src="icons/categories/pdf.svg" alt="" />PDF</button>
+          <button id="file-tab-docx" type="button" role="tab" data-demo-file="docx" aria-selected="false" aria-controls="bento-panel" tabindex="-1"><img src="icons/categories/documents.svg" alt="" />Documents</button>
+          <button id="file-tab-pptx" type="button" role="tab" data-demo-file="pptx" aria-selected="false" aria-controls="bento-panel" tabindex="-1"><img src="icons/categories/slides.svg" alt="" />Slides</button>
+          <button id="file-tab-xlsx" type="button" role="tab" data-demo-file="xlsx" aria-selected="false" aria-controls="bento-panel" tabindex="-1"><img src="icons/categories/spreadsheets.svg" alt="" />Spreadsheets</button>
+          <button id="file-tab-epub" type="button" role="tab" data-demo-file="epub" aria-selected="false" aria-controls="bento-panel" tabindex="-1"><img src="icons/categories/book.svg" alt="" />EPUB</button>
+          <button id="file-tab-srt" type="button" role="tab" data-demo-file="srt" aria-selected="false" aria-controls="bento-panel" tabindex="-1"><img src="icons/categories/subtitles.svg" alt="" />Subtitles</button>
+          <button id="file-tab-zip" type="button" role="tab" data-demo-file="zip" aria-selected="false" aria-controls="bento-panel" tabindex="-1"><img src="icons/categories/archives.svg" alt="" />Archives</button>
+        </div>
+        <div id="bento-panel" role="tabpanel" aria-labelledby="file-tab-jpg" tabindex="0">
+        <div class="bento-grid" data-file-type="jpg">
+          <article class="bento-shortcut">
+            <h2 id="details-title">Image tools</h2>
+            <div class="wheel-pair">
+              <section class="wheel-preview" aria-labelledby="conversion-wheel-title">
+                <div class="wheel-keys" role="img" aria-label="Drag a file, then tap Shift"><span class="demo-key" data-preview-key="Shift" aria-hidden="true"><span>⇧</span>shift</span></div>
+                <h3 id="conversion-wheel-title">Convert formats</h3>
+                <div class="wheel-stage">
+                  <div id="conversion-fan" class="preview-fan" aria-label="File format menu preview"></div>
+                  <div id="conversion-result" class="demo-result" aria-live="polite">Convert to PNG</div>
+                </div>
+              </section>
+              <section class="wheel-preview" aria-labelledby="advanced-wheel-title">
+                <div class="wheel-keys" role="img" aria-label="Drag a file, then tap Alt"><span class="demo-key" data-preview-key="Alt" aria-hidden="true"><span>⎇</span>alt</span></div>
+                <h3 id="advanced-wheel-title">File tools</h3>
+                <div class="wheel-stage">
+                  <div id="advanced-fan" class="preview-fan" aria-label="Advanced file tools preview"></div>
+                  <div id="demo-result" class="demo-result" aria-live="polite">Compress</div>
+                </div>
+              </section>
+            </div>
+            <p class="wheel-note">Start dragging, then tap a key. The wheel stays open until you drop. Change the keys in Settings.</p>
+          </article>
+
+          <div id="bento-cards" class="bento-cards"></div>
+        </div>
+        </div>
+      </section>
+
+      <section class="file-actions-section content-width" id="file-actions" aria-labelledby="file-actions-title">
+        <div class="actions-heading"><div><h2 id="file-actions-title">File actions</h2><p>Drag any file or folder, then tap Control.</p></div></div>
+        <div class="file-actions-layout">
+          <section class="wheel-preview file-actions-preview" aria-labelledby="actions-wheel-title">
+            <div class="wheel-keys" role="img" aria-label="Drag a file or folder, then tap Control"><span class="demo-key" data-preview-key="Control" aria-hidden="true"><span>⌃</span>ctrl</span></div>
+            <h3 id="actions-wheel-title">File actions</h3>
+            <div class="wheel-stage">
+              <div id="actions-fan" class="preview-fan" aria-label="File actions menu preview"></div>
+              <div id="actions-result" class="demo-result" aria-live="polite">Nearby Share</div>
+            </div>
+          </section>
+          <div id="file-action-cards" class="file-action-cards"></div>
+        </div>
+        <p class="actions-footnote">Works with folders, mixed selections, and files that have no conversion tools. File actions do not use your conversion allowance.</p>
+      </section>
+
+      <section class="formats content-width" aria-labelledby="formats-title">
+        <div class="formats-heading"><h2 id="formats-title">Supported formats</h2></div>
+        <div class="format-list">
+          <div class="format-row"><h3>Images</h3><p>JPG <span>PNG</span> WebP <span>HEIC</span> TIFF <span>AVIF</span> BMP</p><span class="format-note">PDF export · SVG input only</span></div>
+          <div class="format-row"><h3>Audio</h3><p>MP3 <span>M4A</span> WAV <span>FLAC</span> OGG <span>Opus</span> AIFF <span>WMA</span></p></div>
+          <div class="format-row"><h3>Video</h3><p>MP4 <span>MOV</span> MKV <span>WebM</span> AVI <span>WMV</span> GIF</p><span class="format-note">MP3 export</span></div>
+          <div class="format-row"><h3>PDF</h3><p><span>PDF →</span> <span>DOCX</span> <span>PAGES</span> <span>PPTX</span> <span>XLSX</span> <span>JPG</span> <span>PNG</span> <span>EPUB</span> <span>TXT</span> <span>MD</span></p><span class="format-note">All pages · images at 300 DPI</span></div>
+          <div class="format-row"><h3>Documents</h3><p>DOCX <span>PAGES</span> Markdown <span>TXT</span> EPUB</p><span class="format-note">RTF, RTFD &amp; text clippings input · HTML export</span></div>
+          <div class="format-row"><h3>Slides</h3><p><span>PPT / PPTX →</span> <span>PDF</span> <span>JPG</span> <span>PNG</span></p><span class="format-note">PPT input only · PDF to PPTX</span></div>
+          <div class="format-row"><h3>Spreadsheets</h3><p>XLSX <span>ODS</span> CSV <span>TSV</span></p><span class="format-note">PDF export · XLS input only</span></div>
+          <div class="format-row"><h3>Subtitles</h3><p>SRT <span>VTT</span></p><span class="format-note">TXT export</span></div>
+          <div class="format-row"><h3>Archives</h3><p>ZIP <span>TAR</span> GZIP</p><span class="format-note">RAR input only</span></div>
+        </div>
+      </section>
+
+      <section class="privacy content-width" aria-labelledby="privacy-title">
+        <div class="privacy-copy">
+          <p class="privacy-eyebrow">Privacy</p>
+          <h2 id="privacy-title">Your files stay on your PC.</h2>
+          <p>Online converters need you to upload a copy of your file. That puts private documents, photos, and metadata on a server you do not control.</p>
+        </div>
+        <div class="privacy-points">
+          <article>
+            <span aria-hidden="true">↑</span>
+            <h3>Uploading adds risk</h3>
+            <p>Your file leaves your PC, so you have to trust how another service stores, processes, and deletes it.</p>
+          </article>
+          <article>
+            <span aria-hidden="true">⌂</span>
+            <h3>Clementine works locally</h3>
+            <p>Conversions and file tools run on your PC. Your files are never uploaded to us.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="download-section content-width" id="download" aria-labelledby="download-title">
+        <div class="download-intro">
+          <p class="download-eyebrow">Get Clementine</p>
+          <h2 id="download-title">Less busywork.<br />More flow.</h2>
+          <p>Download Clementine for Windows from GitHub Releases, or install it with Winget.</p>
+        </div>
+        <div class="download-card">
+          <h3>Clementine for Windows</h3>
+          <ul class="download-includes">
+            <li>All 275 conversion options and 26 file tools, plus 6 file actions</li>
+            <li>Convert, compress, crop, trim, split, and merge</li>
+            <li>Files processed locally on your PC, without uploads</li>
+          </ul>
+          <a href="https://github.com/TejasLamba2006/clementine/releases" class="win-download-btn" aria-label="Download Clementine for Windows"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5.5 10.5 4.5v7H3zM11.5 4.4 21 3v8.5h-9.5zM3 12.5h7.5v7L3 18.5zM11.5 12.5H21V21l-9.5-1.4z"/></svg>Download for Windows</a><a href="https://github.com/TejasLamba2006/clementine" class="win-download-btn secondary">View on GitHub</a><br /><code class="winget-cmd">winget install Clementine</code>
+          <p class="download-compatibility">Windows 10 &amp; 11 (x64 &amp; ARM64) · Native Rust + Direct2D · &lt; 6 MB RAM · 100% Local &amp; Open Source (MIT)</p>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer content-width">
+      <a class="wordmark" href="index.html"><span class="brand-mark" aria-hidden="true"></span>Clementine</a>
+      <div class="footer-actions">
+        <a class="support-link" href="press.html">Press kit</a>
+        <a class="support-link" href="privacy.html">Privacy</a>
+        <a class="support-link" href="https://github.com/TejasLamba2006/clementine/issues">Contact support</a>
+        <a class="support-link" href="https://github.com/TejasLamba2006/clementine/issues/new">Request feature</a>
+      </div>
+    </footer>
+
+    <div id="radial-menu" class="radial-menu" role="menu" aria-label="Choose a conversion format" hidden></div>
+    <div id="drag-ghost" class="drag-ghost" aria-hidden="true" hidden></div>
+    <div id="drag-shift-prompt" class="drag-shift-prompt" aria-hidden="true" hidden>
+      <p>Tap Shift on your keyboard</p>
+      <span class="demo-key"><span>⇧</span>shift</span>
+    </div>
+    <div id="drag-wheel-prompt" class="drag-wheel-prompt" aria-hidden="true" hidden>
+      <span><kbd>⇧</kbd> Convert</span><span><kbd>⎇</kbd> Tools</span><span><kbd>⌃</kbd> Actions</span>
+    </div>
+    <aside id="action-demo" class="action-demo" aria-labelledby="action-demo-title" hidden></aside>
+    <div class="sr-only" id="announcement" role="status" aria-live="polite"></div>
+    <p class="sr-only" id="file-instructions">Drag a file, then tap Shift for conversions, Alt for file tools, or Control for actions. Release the key and keep dragging; the wheel stays open until you drop or cancel. Or press Enter on a file to open the format menu, then use Alt or Control to switch wheels. Use arrow keys to choose, Enter to apply, and Escape to cancel. On a touch screen, drag to move or hold a file briefly before dragging to convert. All operations on this page are simulated.</p>
+
+  </body>
+</html>
