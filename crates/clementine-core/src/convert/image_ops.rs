@@ -59,8 +59,98 @@ fn color(s: &str) -> Option<[u8; 4]> {
     }
 }
 
-/// ponytail: rasterizes only `<rect>`, `<circle>` and `<ellipse>` with solid
-/// fills; add `resvg` when paths, gradients or text are needed.
+fn path_num(b: &[char], i: &mut usize) -> Option<f32> {
+    while *i < b.len() && (b[*i].is_whitespace() || b[*i] == ',') {
+        *i += 1;
+    }
+    let s = *i;
+    if *i < b.len() && (b[*i] == '-' || b[*i] == '+') {
+        *i += 1;
+    }
+    while *i < b.len() && (b[*i].is_ascii_digit() || b[*i] == '.') {
+        *i += 1;
+    }
+    b[s..*i].iter().collect::<String>().parse().ok()
+}
+
+/// Parses `M L H V Z` (plus lowercase relative forms) into polygons.
+fn parse_path(d: &str) -> Vec<Vec<(f32, f32)>> {
+    let b: Vec<char> = d.chars().collect();
+    let (mut polys, mut cur) = (Vec::new(), Vec::new());
+    let (mut pt, mut start, mut cmd, mut i) = ((0.0f32, 0.0f32), (0.0f32, 0.0f32), ' ', 0);
+    while i < b.len() {
+        if b[i].is_whitespace() || b[i] == ',' {
+            i += 1;
+        } else if b[i].is_ascii_alphabetic() {
+            cmd = b[i];
+            i += 1;
+            if cmd.eq_ignore_ascii_case(&'z') {
+                pt = start;
+                if !cur.is_empty() {
+                    polys.push(std::mem::take(&mut cur));
+                }
+            }
+        } else {
+            let rel = cmd.is_ascii_lowercase();
+            let o = if rel { pt } else { (0.0, 0.0) };
+            let Some(n) = path_num(&b, &mut i) else {
+                i += 1;
+                continue;
+            };
+            match cmd.to_ascii_uppercase() {
+                'H' => pt.0 = o.0 + n,
+                'V' => pt.1 = o.1 + n,
+                'M' | 'L' => {
+                    let Some(y) = path_num(&b, &mut i) else { break };
+                    pt = (o.0 + n, o.1 + y);
+                    if cmd.eq_ignore_ascii_case(&'m') {
+                        if !cur.is_empty() {
+                            polys.push(std::mem::take(&mut cur));
+                        }
+                        start = pt;
+                        cmd = if rel { 'l' } else { 'L' };
+                    }
+                }
+                _ => continue,
+            }
+            cur.push(pt);
+        }
+    }
+    if !cur.is_empty() {
+        polys.push(cur);
+    }
+    polys
+}
+
+/// Even-odd scanline fill.
+fn fill_path(img: &mut RgbaImage, d: &str, fill: [u8; 4], vx: f32, vy: f32) {
+    let polys = parse_path(d);
+    for y in 0..img.height() {
+        let yc = y as f32 + vy + 0.5;
+        let mut xs = Vec::new();
+        for poly in &polys {
+            for (k, a) in poly.iter().enumerate() {
+                let b = poly[(k + 1) % poly.len()];
+                if (a.1 <= yc) != (b.1 <= yc) {
+                    xs.push(a.0 + (yc - a.1) / (b.1 - a.1) * (b.0 - a.0));
+                }
+            }
+        }
+        xs.sort_by(|a, b| a.total_cmp(b));
+        for pair in xs.chunks_exact(2) {
+            for x in 0..img.width() {
+                let xc = x as f32 + vx + 0.5;
+                if xc >= pair[0] && xc < pair[1] {
+                    img.put_pixel(x, y, Rgba(fill));
+                }
+            }
+        }
+    }
+}
+
+/// ponytail: rasterizes `<rect>`, `<circle>`, `<ellipse>` and straight-line
+/// `<path>` (M/L/H/V/Z) with solid fills; add `resvg` for curves, gradients
+/// or text.
 fn render_svg(text: &str) -> Result<RgbaImage> {
     let svg_start = text.find("<svg").ok_or_else(|| ie("not an svg document"))?;
     let root_end = text[svg_start..].find('>').ok_or_else(|| ie("malformed svg"))? + svg_start;
@@ -92,6 +182,12 @@ fn render_svg(text: &str) -> Result<RgbaImage> {
             Some(f) => color(&f).unwrap_or([0, 0, 0, 255]),
             None => [0, 0, 0, 255],
         };
+        if kind == "path" {
+            if let Some(d) = attr(tag, "d") {
+                fill_path(&mut img, &d, fill, vx, vy);
+            }
+            continue;
+        }
         let g = |n: &str| attr(tag, n).map(|v| num(&v)).unwrap_or(0.0);
         let inside: Box<dyn Fn(f32, f32) -> bool> = match kind {
             "rect" => {
@@ -389,6 +485,22 @@ mod tests {
         assert_eq!(img.get_pixel(2, 5).0, [255, 0, 0, 255]);
         assert_eq!(img.get_pixel(15, 5).0, [0, 0, 255, 255]);
         assert_eq!(img.get_pixel(11, 0).0[3], 0);
+    }
+
+    #[test]
+    fn svg_path_rasterizes() {
+        let d = tempfile::tempdir().unwrap();
+        let svg = d.path().join("p.svg");
+        fs::write(
+            &svg,
+            r##"<svg viewBox="0 0 20 20"><path d="M2 2 H10 V10 L2 10 Z" fill="#00ff00"/><path d="m12 12 h6 v6 h-6 z" fill="red"/></svg>"##,
+        )
+        .unwrap();
+        let img = image::open(execute_conversion(&svg, "png").unwrap()).unwrap().to_rgba8();
+        assert_eq!(img.get_pixel(5, 5).0, [0, 255, 0, 255]);
+        assert_eq!(img.get_pixel(15, 15).0, [255, 0, 0, 255]);
+        assert_eq!(img.get_pixel(11, 5).0[3], 0);
+        assert_eq!(img.get_pixel(0, 0).0[3], 0);
     }
 
     #[test]

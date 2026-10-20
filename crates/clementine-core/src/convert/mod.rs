@@ -107,7 +107,7 @@ enum Kind {
 fn route(src: &str, target: &str) -> Option<Kind> {
     if matches!(src, "zip" | "tar" | "gz") {
         Some(Kind::Archive)
-    } else if matches!(src, "srt" | "vtt" | "csv" | "tsv" | "md" | "txt") {
+    } else if matches!(src, "srt" | "vtt" | "csv" | "tsv" | "md" | "txt" | "xlsx" | "html") {
         Some(Kind::Doc)
     } else if src == "gif" && media_ops::is_video_ext(target) {
         Some(Kind::Media)
@@ -209,6 +209,8 @@ fn dispatch(
                 Err(unsupported())
             }
         }
+        "splitPDF" => doc_ops::split_pdf(&job[0], out),
+        "mergePDF" => doc_ops::merge_pdf(job, out),
         "extractArchive" => archive_ops::extract(&job[0], ext, out),
         "muteVideo" | "trimVideo" | "trimAudio" | "changeVideoSpeed" | "normalizeAudio"
         | "audioChannels" | "audioToVideo" | "redactAudio" | "splitVideo" | "joinVideos"
@@ -267,6 +269,77 @@ mod tests {
             Err(ClementineError::UnsupportedTool(_))
         ));
         assert_eq!(names(d.path()), vec!["a.xyz"]);
+    }
+
+    fn txt_pdf(d: &Path, name: &str, lines: usize) -> PathBuf {
+        let p = d.join(format!("{name}.txt"));
+        let t: String = (0..lines).map(|i| format!("{name} line {i}\n")).collect();
+        fs::write(&p, t).unwrap();
+        execute_conversion(&p, "pdf").unwrap()
+    }
+
+    #[test]
+    fn split_and_merge_pdf() {
+        let d = tempfile::tempdir().unwrap();
+        let a = txt_pdf(d.path(), "a", 120); // 3 pages
+        let b = txt_pdf(d.path(), "b", 3); // 1 page
+        let dir = execute_tool(&[a.clone()], "splitPDF", &ToolParams::default()).unwrap();
+        for n in 1..=3 {
+            let bytes = fs::read(dir.join(format!("Page {n}.pdf"))).unwrap();
+            assert!(bytes.starts_with(b"%PDF-1.4") && bytes.ends_with(b"%%EOF\n"));
+            assert!(String::from_utf8_lossy(&bytes).contains("/Count 1"));
+        }
+        assert!(!dir.join("Page 4.pdf").exists());
+        assert!(String::from_utf8_lossy(&fs::read(dir.join("Page 1.pdf")).unwrap()).contains("a line 0"));
+        let m = execute_tool(&[a, b], "mergePDF", &ToolParams::default()).unwrap();
+        let s = String::from_utf8_lossy(&fs::read(m).unwrap()).into_owned();
+        assert!(s.contains("/Count 4") && s.contains("b line 2") && s.contains("a line 119"));
+        let png = sample_png(d.path(), "i.png", 8, 8);
+        let ipdf = execute_conversion(&png, "pdf").unwrap();
+        let idir = execute_tool(&[ipdf], "splitPDF", &ToolParams::default()).unwrap();
+        let ib = fs::read(idir.join("Page 1.pdf")).unwrap();
+        assert!(String::from_utf8_lossy(&ib).contains("DCTDecode"));
+    }
+
+    #[test]
+    fn csv_xlsx_roundtrip() {
+        let d = tempfile::tempdir().unwrap();
+        let csv = "name,note\nann,\"a,b\"\nbob,x < y\n";
+        let p = d.path().join("t.csv");
+        fs::write(&p, csv).unwrap();
+        let x = execute_conversion(&p, "xlsx").unwrap();
+        let mut z = zip::ZipArchive::new(fs::File::open(&x).unwrap()).unwrap();
+        for n in [
+            "[Content_Types].xml",
+            "_rels/.rels",
+            "xl/workbook.xml",
+            "xl/_rels/workbook.xml.rels",
+            "xl/worksheets/sheet1.xml",
+        ] {
+            assert!(z.by_name(n).is_ok(), "{n}");
+        }
+        assert_eq!(fs::read_to_string(execute_conversion(&x, "csv").unwrap()).unwrap(), csv);
+        let t = fs::read_to_string(execute_conversion(&x, "tsv").unwrap()).unwrap();
+        assert!(t.starts_with("name\tnote\nann\ta,b\n"));
+        let tp = d.path().join("u.tsv");
+        fs::write(&tp, "a\tb\n1\t2\n").unwrap();
+        let x2 = execute_conversion(&tp, "xlsx").unwrap();
+        assert_eq!(fs::read_to_string(execute_conversion(&x2, "csv").unwrap()).unwrap(), "a,b\n1,2\n");
+    }
+
+    #[test]
+    fn html_to_txt_md() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("h.html");
+        fs::write(
+            &p,
+            "<html><body><h1>Title</h1>\n<p>Tom &amp; <b>Jerry</b> &lt;3 &quot;hi&quot;</p><ul><li>one</li><li>two<br>three</li></ul><h2>Sub</h2></body></html>",
+        )
+        .unwrap();
+        let md = fs::read_to_string(execute_conversion(&p, "md").unwrap()).unwrap();
+        assert_eq!(md, "# Title\n\nTom & Jerry <3 \"hi\"\n\n- one\n- two\nthree\n\n## Sub\n");
+        let txt = fs::read_to_string(execute_conversion(&p, "txt").unwrap()).unwrap();
+        assert!(txt.starts_with("Title\n\nTom & Jerry") && !txt.contains('#') && !txt.contains("<b>") && txt.contains("<3"));
     }
 
     #[test]
