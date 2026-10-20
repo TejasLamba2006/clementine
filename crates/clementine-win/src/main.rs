@@ -1,1 +1,470 @@
-fn main() {}
+mod actions;
+mod drop_target;
+mod hook;
+mod renderer;
+mod shelf;
+
+use clementine_core::*;
+use drop_target::*;
+use hook::*;
+use renderer::*;
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+use windows_sys::Win32::Foundation::*;
+use windows_sys::Win32::Graphics::Gdi::*;
+use windows_sys::Win32::Media::Audio::*;
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Ole::OleInitialize;
+use windows_sys::Win32::System::ProcessStatus::*;
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
+use windows_sys::Win32::UI::WindowsAndMessaging::*;
+
+static CLICK_WAV: &[u8] = include_bytes!("../assets/highlight.wav");
+const TIMER_ID: usize = 1;
+const BLOOM_MS: f64 = 200.0;
+const S: i32 = SIZE as i32;
+
+struct Wheel {
+    open: bool,
+    demo_until: Option<Instant>,
+    mode: WheelMode,
+    ext: String,
+    paths: Vec<PathBuf>,
+    ids: Vec<String>,
+    labels: Vec<String>,
+    selected: Option<usize>,
+    center: String,
+    base: Vec<Px>,
+    frame: Vec<u32>,
+    cx: i32,
+    cy: i32,
+    t0: Instant,
+}
+
+thread_local! {
+    static W: RefCell<Option<Wheel>> = const { RefCell::new(None) };
+}
+
+fn w16(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(Some(0)).collect()
+}
+
+fn human_size(bytes: u64) -> String {
+    let mb = bytes as f64 / 1_048_576.0;
+    if mb >= 1.0 {
+        format!("{mb:.1} MB")
+    } else {
+        format!("{:.0} KB", (bytes as f64 / 1024.0).max(1.0))
+    }
+}
+
+fn ext_of(p: &Path) -> String {
+    p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default()
+}
+
+/// Petal ids and labels for a mode (max 9 petals, the renderer limit).
+fn targets(mode: WheelMode, ext: &str, count: usize) -> (Vec<String>, Vec<String>) {
+    let ids: Vec<&str> = match mode {
+        WheelMode::Conversions => conversion_targets(ext),
+        WheelMode::Tools => tool_targets(ext, count),
+        WheelMode::Actions => action_targets(),
+    };
+    let ids: Vec<&str> = ids.into_iter().take(9).collect();
+    let labels = ids
+        .iter()
+        .map(|id| match mode {
+            WheelMode::Conversions => format_label(id),
+            _ => tool_meta(id).map(|t| t.title.to_string()).unwrap_or_else(|| id.to_string()),
+        })
+        .collect();
+    (ids.iter().map(|s| s.to_string()).collect(), labels)
+}
+
+fn rerender(w: &mut Wheel) {
+    let center = match w.selected {
+        Some(i) => w.labels[i].clone(),
+        None => w.center.clone(),
+    };
+    w.frame = render(&w.base, &w.labels, w.selected, &center);
+}
+
+fn refresh_targets(w: &mut Wheel) {
+    let ext = w.paths.first().map(|p| ext_of(p)).unwrap_or_else(|| w.ext.clone());
+    let (ids, labels) = targets(w.mode, &ext, w.paths.len().max(1));
+    w.ids = ids;
+    w.labels = labels;
+    w.selected = None;
+    if !w.paths.is_empty() {
+        let total: u64 = w.paths.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
+        w.center = human_size(total);
+    }
+    rerender(w);
+}
+
+fn present(hwnd: HWND, w: &Wheel) {
+    let t = ((w.t0.elapsed().as_secs_f64() * 1000.0) / BLOOM_MS).min(1.0);
+    let e = bloom_ease(t);
+    let (scale, alpha) = (0.45 + 0.55 * e, e);
+    let mut d = Dib::new();
+    let out = d.slice();
+    if t >= 1.0 {
+        out.copy_from_slice(&w.frame);
+    } else {
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                let sx = ((x as f64 - 136.0) / scale + 136.0).round();
+                let sy = ((y as f64 - 136.0) / scale + 136.0).round();
+                out[y * SIZE + x] = if sx >= 0.0 && sy >= 0.0 && sx < SIZE as f64 && sy < SIZE as f64 {
+                    w.frame[sy as usize * SIZE + sx as usize]
+                } else {
+                    0
+                };
+            }
+        }
+    }
+    unsafe {
+        let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: (alpha * 255.0) as u8, AlphaFormat: AC_SRC_ALPHA as u8 };
+        let pt = POINT { x: w.cx - 136, y: w.cy - 136 };
+        let sz = SIZE { cx: S, cy: S };
+        let src = POINT { x: 0, y: 0 };
+        UpdateLayeredWindow(hwnd, std::ptr::null_mut(), &pt, &sz, d.dc, &src, 0, &blend, ULW_ALPHA);
+    }
+}
+
+
+fn open_wheel(hwnd: HWND, mode: WheelMode, demo: bool) {
+    let mut pt = POINT { x: 0, y: 0 };
+    unsafe { GetCursorPos(&mut pt) };
+    W.with(|c| {
+        let mut g = c.borrow_mut();
+        let w = g.as_mut().unwrap();
+        let was_open = w.open;
+        w.mode = mode;
+        if !was_open {
+            w.cx = pt.x;
+            w.cy = pt.y;
+            w.base = make_base(capture_screen(pt.x, pt.y).as_deref());
+            w.t0 = Instant::now();
+            w.open = true;
+            if demo {
+                w.demo_until = Some(Instant::now() + std::time::Duration::from_secs(3));
+            }
+        }
+        refresh_targets(w);
+        unsafe {
+            if !was_open {
+                let ring = CreateEllipticRgn(10, 10, 262, 262);
+                let hole = CreateEllipticRgn(94, 94, 178, 178);
+                CombineRgn(ring, ring, hole, RGN_DIFF);
+                DeleteObject(hole);
+                SetWindowRgn(hwnd, ring, 0);
+                SetWindowPos(hwnd, HWND_TOPMOST, w.cx - 136, w.cy - 136, S, S, SWP_NOACTIVATE);
+                present(hwnd, w);
+                ShowWindow(hwnd, SW_SHOWNA);
+                SetTimer(hwnd, TIMER_ID, 16, None);
+            } else {
+                present(hwnd, w);
+            }
+        }
+    });
+}
+
+fn close_wheel(hwnd: HWND) {
+    W.with(|c| {
+        if let Some(w) = c.borrow_mut().as_mut() {
+            w.open = false;
+        }
+    });
+    unsafe {
+        KillTimer(hwnd, TIMER_ID);
+        ShowWindow(hwnd, SW_HIDE);
+        SetWindowRgn(hwnd, std::ptr::null_mut(), 0);
+    }
+}
+
+fn select_at(hwnd: HWND, sx: i32, sy: i32) {
+    W.with(|c| {
+        let mut g = c.borrow_mut();
+        let Some(w) = g.as_mut().filter(|w| w.open) else { return };
+        let sel = hit_test_petal((sx - w.cx) as f64, (sy - w.cy) as f64, w.labels.len());
+        if sel != w.selected {
+            w.selected = sel;
+            rerender(w);
+            present(hwnd, w);
+            if sel.is_some() {
+                unsafe { PlaySoundW(CLICK_WAV.as_ptr() as _, std::ptr::null_mut(), SND_MEMORY | SND_ASYNC | SND_NODEFAULT) };
+            }
+        }
+    });
+}
+
+fn commit(hwnd: HWND) {
+    let job = W.with(|c| {
+        let g = c.borrow();
+        let w = g.as_ref()?;
+        let i = w.selected?;
+        Some((w.mode, w.ids[i].clone(), w.paths.clone()))
+    });
+    let demo = W.with(|c| c.borrow().as_ref().is_some_and(|w| w.demo_until.is_some()));
+    close_wheel(hwnd);
+    let Some((mode, id, paths)) = job else { return };
+    if paths.is_empty() {
+        println!("selected {id} (no files)");
+        return;
+    }
+    match mode {
+        WheelMode::Conversions => {
+            for p in &paths {
+                match execute_conversion(p, &id) {
+                    Ok(o) => println!("wrote {}", o.display()),
+                    Err(e) => eprintln!("convert failed: {e}"),
+                }
+            }
+        }
+        WheelMode::Tools => match execute_tool(&paths, &id, &ToolParams::default()) {
+            Ok(o) => println!("wrote {}", o.display()),
+            Err(e) => eprintln!("tool failed: {e}"),
+        },
+        WheelMode::Actions => actions::run(hwnd, &id, &paths),
+    }
+    if demo {
+        unsafe { PostQuitMessage(0) };
+    }
+}
+
+unsafe extern "system" fn wnd_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let (x, y) = (wp as i32, lp as i32);
+    match m {
+        WM_APP_WHEEL_KEY => {
+            let mode = [WheelMode::Conversions, WheelMode::Tools, WheelMode::Actions][wp.min(2)];
+            open_wheel(hwnd, mode, false);
+            0
+        }
+        WM_APP_ENTER => {
+            W.with(|c| {
+                if let Some(w) = c.borrow_mut().as_mut() {
+                    w.paths = PATHS.lock().unwrap().clone();
+                    if w.open {
+                        refresh_targets(w);
+                        present(hwnd, w);
+                    }
+                }
+            });
+            select_at(hwnd, x, y);
+            0
+        }
+        WM_APP_OVER => {
+            select_at(hwnd, x, y);
+            0
+        }
+        WM_APP_DROP => {
+            select_at(hwnd, x, y);
+            W.with(|c| {
+                if let Some(w) = c.borrow_mut().as_mut() {
+                    w.paths = PATHS.lock().unwrap().clone();
+                }
+            });
+            commit(hwnd);
+            0
+        }
+        WM_APP_DRAG_END => {
+            let on = W.with(|c| c.borrow().as_ref().is_some_and(|w| w.open && w.demo_until.is_none()));
+            if on {
+                // Outside-wheel release closes it; an in-wheel drop arrives via IDropTarget first.
+                close_wheel(hwnd);
+            }
+            0
+        }
+        WM_APP_LEAVE => 0,
+        WM_APP_ESC => {
+            close_wheel(hwnd);
+            0
+        }
+        WM_MOUSEMOVE => {
+            let mut pt = POINT { x: 0, y: 0 };
+            GetCursorPos(&mut pt);
+            if W.with(|c| c.borrow().as_ref().is_some_and(|w| w.demo_until.is_some())) {
+                select_at(hwnd, pt.x, pt.y);
+            }
+            0
+        }
+        WM_LBUTTONDOWN => {
+            if W.with(|c| c.borrow().as_ref().is_some_and(|w| w.demo_until.is_some())) {
+                commit(hwnd);
+                PostQuitMessage(0);
+            }
+            0
+        }
+        WM_TIMER => {
+            let (open, bloom, demo_over) = W.with(|c| {
+                let g = c.borrow();
+                let w = g.as_ref().unwrap();
+                (w.open, w.t0.elapsed().as_secs_f64() * 1000.0 < BLOOM_MS + 32.0, w.demo_until.is_some_and(|d| Instant::now() >= d))
+            });
+            if open && bloom {
+                W.with(|c| present(hwnd, c.borrow().as_ref().unwrap()));
+            }
+            if demo_over || (GetAsyncKeyState(VK_ESCAPE as i32) as u16 & 0x8000 != 0 && W.with(|c| c.borrow().as_ref().is_some_and(|w| w.demo_until.is_some()))) {
+                close_wheel(hwnd);
+                PostQuitMessage(0);
+            }
+            0
+        }
+        WM_DESTROY => {
+            PostQuitMessage(0);
+            0
+        }
+        _ => DefWindowProcW(hwnd, m, wp, lp),
+    }
+}
+
+fn create_window() -> HWND {
+    unsafe {
+        OleInitialize(std::ptr::null());
+        let hi = GetModuleHandleW(std::ptr::null());
+        let class = w16("ClementineWheel");
+        let wc = WNDCLASSW {
+            style: 0,
+            lpfnWndProc: Some(wnd_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hi,
+            hIcon: std::ptr::null_mut(),
+            hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
+            hbrBackground: std::ptr::null_mut(),
+            lpszMenuName: std::ptr::null(),
+            lpszClassName: class.as_ptr(),
+        };
+        RegisterClassW(&wc);
+        let h = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            class.as_ptr(),
+            class.as_ptr(),
+            WS_POPUP,
+            0, 0, S, S,
+            std::ptr::null_mut(), std::ptr::null_mut(), hi, std::ptr::null(),
+        );
+        W.with(|c| {
+            *c.borrow_mut() = Some(Wheel {
+                open: false,
+                demo_until: None,
+                mode: WheelMode::Conversions,
+                ext: "png".into(),
+                paths: vec![],
+                ids: vec![],
+                labels: vec![],
+                selected: None,
+                center: "2.2 MB".into(),
+                base: vec![],
+                frame: vec![],
+                cx: 0,
+                cy: 0,
+                t0: Instant::now(),
+            })
+        });
+        h
+    }
+}
+
+fn message_loop() {
+    unsafe {
+        let mut msg: MSG = std::mem::zeroed();
+        while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
+fn parse_mode(s: Option<&String>) -> WheelMode {
+    match s.map(|s| s.as_str()) {
+        Some("tools") => WheelMode::Tools,
+        Some("actions") => WheelMode::Actions,
+        _ => WheelMode::Conversions,
+    }
+}
+
+fn working_set_mb() -> f64 {
+    unsafe {
+        let mut pmc: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+        pmc.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        K32GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb);
+        pmc.WorkingSetSize as f64 / 1_048_576.0
+    }
+}
+
+fn render_state(mode: WheelMode, ext: &str, sel: Option<usize>, center: &str) -> Vec<u32> {
+    let (_, labels) = targets(mode, ext, 1);
+    let base = make_base(Some(&synthetic_backdrop()));
+    let c = match sel {
+        Some(i) if i < labels.len() => labels[i].as_str(),
+        _ => center,
+    };
+    render(&base, &labels, sel, c)
+}
+
+fn self_test() -> std::result::Result<(), String> {
+    let px = render_state(WheelMode::Conversions, "svg", Some(2), "2.2 MB");
+    let img = to_image(&px);
+    std::fs::create_dir_all("target").map_err(|e| e.to_string())?;
+    img.save("target/self-test-wheel.png").map_err(|e| e.to_string())?;
+    if px.iter().all(|p| p >> 24 == 0) {
+        return Err("no opaque pixels".into());
+    }
+    if px[100 * SIZE + 136] >> 24 != 0 {
+        return Err("center hole not transparent".into());
+    }
+    if !img.pixels().any(|p| p[3] == 255 && p[0] >= 253 && (80..=84).contains(&p[1]) && p[2] <= 2) {
+        return Err("no #FF5200 highlight pixels".into());
+    }
+    let mb = working_set_mb();
+    println!("WorkingSet: {mb:.2} MB");
+    if mb >= 15.0 {
+        return Err(format!("working set {mb:.2} MB >= 15 MB"));
+    }
+    println!("self-test ok: target/self-test-wheel.png");
+    Ok(())
+}
+
+fn main() {
+    let a: Vec<String> = std::env::args().collect();
+    match a.get(1).map(|s| s.as_str()) {
+        Some("--self-test") => {
+            if let Err(e) = self_test() {
+                eprintln!("self-test FAILED: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some("--render-wheel") => {
+            let out = a.get(2).expect("usage: --render-wheel <out.png> [conversions|tools|actions] [ext] [highlight_idx]");
+            let ext = a.get(4).map(|s| s.as_str()).unwrap_or("svg");
+            let sel = a.get(5).and_then(|s| s.parse().ok());
+            let px = render_state(parse_mode(a.get(3)), ext, sel, "2.2 MB");
+            to_image(&px).save(out).expect("save png");
+        }
+        Some("--convert") => {
+            let (Some(p), Some(t)) = (a.get(2), a.get(3)) else { return eprintln!("usage: --convert <input_path> <target_ext>") };
+            match execute_conversion(Path::new(p), t) {
+                Ok(o) => println!("{}", o.display()),
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("--demo") => {
+            let h = create_window();
+            drop_target::register(h);
+            open_wheel(h, parse_mode(a.get(2)), true);
+            message_loop();
+        }
+        _ => {
+            let h = create_window();
+            drop_target::register(h);
+            hook::install(h as usize);
+            message_loop();
+        }
+    }
+}
