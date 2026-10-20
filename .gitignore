@@ -1,0 +1,8 @@
+/target
+/docs/superpowers
+/.superpowers
+/.audit
+*.pdb
+*.ilk
+.DS_Store
+Thumbs.db
