@@ -203,6 +203,8 @@ pub fn hit_test_petal(dx: f64, dy: f64, count: usize) -> Option<usize> {
     let diff = l - petal_angle(d, count);
     if diff.sin().atan2(diff.cos()).abs() > s / 2.0 - (PETAL_GAP / 2.0 / n).asin() {
         None
+    } else if !build_petal_geometry(d, count).contains_point(dx, dy) {
+        None
     } else {
         Some(d)
     }
@@ -276,6 +278,13 @@ mod tests {
         assert_eq!(hit_test_petal(0.0, -80.0, 0), None);
         let (x, y) = polar_to_cartesian(80.0, a + 0.2);
         assert_eq!(hit_test_petal(x, y, 4), Some(0));
+    }
+
+    #[test]
+    fn hit_test_rounded_corner_cutout() {
+        // inside polar sector, but outside the rounded outer corner
+        let (x, y) = polar_to_cartesian(119.0, PI / 2.0 + 0.74);
+        assert_eq!(hit_test_petal(x, y, 4), None);
     }
 
     #[test]
