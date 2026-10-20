@@ -1,6 +1,7 @@
 mod actions;
 mod drop_target;
 mod hook;
+mod install;
 mod renderer;
 mod shelf;
 
@@ -26,6 +27,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 static CLICK_WAV: &[u8] = include_bytes!("../assets/highlight.wav");
 const TIMER_ID: usize = 1;
 const TIMER_CLOSE_ID: usize = 2;
+const TIMER_DEMO_ID: usize = 3;
+const TIMER_TOUR_ID: usize = 4;
 const WM_APP_TRAY: u32 = WM_APP + 20;
 const BLOOM_MS: f64 = 200.0;
 const S: i32 = SIZE as i32;
@@ -49,6 +52,7 @@ struct Wheel {
 
 thread_local! {
     static W: RefCell<Option<Wheel>> = const { RefCell::new(None) };
+    static TOUR_STEP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn w16(s: &str) -> Vec<u16> {
@@ -208,11 +212,13 @@ fn close_wheel(hwnd: HWND) {
     W.with(|c| {
         if let Some(w) = c.borrow_mut().as_mut() {
             w.open = false;
+            w.paths.clear();
         }
     });
     unsafe {
         KillTimer(hwnd, TIMER_ID);
         KillTimer(hwnd, TIMER_CLOSE_ID);
+        KillTimer(hwnd, TIMER_DEMO_ID);
         ShowWindow(hwnd, SW_HIDE);
         SetWindowRgn(hwnd, std::ptr::null_mut(), 0);
     }
@@ -331,6 +337,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM) -
             }
             0
         }
+        WM_TIMER if wp == TIMER_DEMO_ID => {
+            close_wheel(hwnd);
+            0
+        }
+        WM_TIMER if wp == TIMER_TOUR_ID => {
+            tour_tick(hwnd);
+            0
+        }
         WM_TIMER if wp == TIMER_CLOSE_ID => {
             KillTimer(hwnd, TIMER_CLOSE_ID);
             let commit_it = W.with(|c| c.borrow().as_ref().is_some_and(|w| w.open && w.selected.is_some() && !w.paths.is_empty()));
@@ -344,8 +358,15 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM) -
         WM_APP_TRAY => {
             if matches!(lp as u32, WM_RBUTTONUP | WM_CONTEXTMENU) {
                 let menu = CreatePopupMenu();
-                for (id, s) in [(1, "Open Demo Wheel"), (2, "Show Floating Shelf"), (3, "Quit Clementine")] {
-                    AppendMenuW(menu, MF_STRING, id, w16(s).as_ptr());
+                let on = if install::is_startup_enabled() { MF_CHECKED } else { MF_UNCHECKED };
+                for (id, s, f) in [
+                    (1, "Open Demo Wheel", MF_STRING),
+                    (2, "Show Floating Shelf", MF_STRING),
+                    (3, "Run at Windows Startup", MF_STRING | on),
+                    (4, "Install to Start Menu & Programs", MF_STRING),
+                    (5, "Quit Clementine", MF_STRING),
+                ] {
+                    AppendMenuW(menu, f, id, w16(s).as_ptr());
                 }
                 let mut pt = POINT { x: 0, y: 0 };
                 GetCursorPos(&mut pt);
@@ -360,10 +381,22 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM) -
             match wp & 0xFFFF {
                 1 => {
                     open_wheel(hwnd, WheelMode::Conversions, false);
-                    SetTimer(hwnd, TIMER_CLOSE_ID, 3000, None);
+                    SetTimer(hwnd, TIMER_DEMO_ID, 3000, None);
                 }
                 2 => shelf::add(hwnd, &[]),
-                3 => PostQuitMessage(0),
+                3 => {
+                    let inst = install::installed_exe_path();
+                    let exe = if inst.exists() { inst } else { std::env::current_exe().unwrap_or_default() };
+                    if let Err(e) = install::set_startup_enabled(!install::is_startup_enabled(), &exe) {
+                        eprintln!("startup toggle failed: {e}");
+                    }
+                }
+                4 => {
+                    if let Err(e) = install::install_app(false) {
+                        eprintln!("install failed: {e}");
+                    }
+                }
+                5 => PostQuitMessage(0),
                 _ => {}
             }
             0
@@ -402,7 +435,7 @@ fn create_window() -> HWND {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: hi,
-            hIcon: std::ptr::null_mut(),
+            hIcon: load_icon(),
             hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
             hbrBackground: std::ptr::null_mut(),
             lpszMenuName: std::ptr::null(),
@@ -470,9 +503,60 @@ fn tray_icon() -> HICON {
     unsafe { CreateIcon(std::ptr::null_mut(), 16, 16, 1, 32, and.as_ptr(), xor.as_ptr()) }
 }
 
+/// Icon embedded by build.rs (resource ID 1), falling back to the generated one.
+fn load_icon() -> HICON {
+    let h = unsafe { LoadIconW(GetModuleHandleW(std::ptr::null()), 1 as *const u16) };
+    if h.is_null() { tray_icon() } else { h }
+}
+
+const TOUR: [(WheelMode, [usize; 4]); 3] = [
+    (WheelMode::Conversions, [0, 1, 2, 6]),
+    (WheelMode::Tools, [0, 2, 4, 5]),
+    (WheelMode::Actions, [0, 1, 2, 5]),
+];
+
+/// One 350ms step of `--live-Tour`: highlight a petal, switching wheel every 4 steps, quit after the last.
+fn tour_tick(hwnd: HWND) {
+    let step = TOUR_STEP.with(|s| s.replace(s.get() + 1));
+    if step >= 12 {
+        unsafe {
+            KillTimer(hwnd, TIMER_TOUR_ID);
+            PostQuitMessage(0);
+        }
+        close_wheel(hwnd);
+        return;
+    }
+    let (mode, petals) = TOUR[step / 4];
+    W.with(|c| {
+        let mut g = c.borrow_mut();
+        let w = g.as_mut().unwrap();
+        if w.mode != mode {
+            w.mode = mode;
+            refresh_targets(w);
+        }
+        if w.labels.is_empty() {
+            return;
+        }
+        w.selected = Some(petals[step % 4].min(w.labels.len() - 1));
+        rerender(w);
+        present(hwnd, w);
+    });
+}
+
+fn live_tour() {
+    let h = create_window();
+    unsafe {
+        let (cx, cy) = (GetSystemMetrics(SM_CXSCREEN) / 2, GetSystemMetrics(SM_CYSCREEN) / 2);
+        SetCursorPos(cx, cy);
+        open_wheel(h, WheelMode::Conversions, false);
+        SetTimer(h, TIMER_TOUR_ID, 350, None);
+    }
+    message_loop();
+}
+
 fn add_tray(hwnd: HWND) {
     let mut nid = tray_data(hwnd);
-    nid.hIcon = tray_icon();
+    nid.hIcon = load_icon();
     unsafe { Shell_NotifyIconW(NIM_ADD, &nid) };
 }
 
@@ -573,6 +657,32 @@ fn main() {
             drop_target::register(h);
             open_wheel(h, parse_mode(a.get(2)), true);
             message_loop();
+        }
+        Some("--install") | Some("--install-quiet") => {
+            let quiet = a[1] == "--install-quiet";
+            if let Err(e) = install::install_app(quiet) {
+                eprintln!("install failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some("--uninstall") => {
+            if let Err(e) = install::uninstall_app(false) {
+                eprintln!("uninstall failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some("--live-Tour") | Some("--live-tour") => live_tour(),
+        None if std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()))
+            .is_some_and(|n| n.contains("setup") || n.contains("install")) =>
+        {
+            match install::install_app(false) {
+                Ok(exe) => {
+                    let _ = std::process::Command::new(exe).arg("--startup").spawn();
+                }
+                Err(e) => eprintln!("install failed: {e}"),
+            }
         }
         _ => {
             let h = create_window();
