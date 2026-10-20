@@ -47,6 +47,24 @@ pub struct ToolParams {
     pub speed_factor: f32,
     pub start_sec: f32,
     pub end_sec: Option<f32>,
+    /// -1..=1, added to every channel.
+    pub brightness: f32,
+    /// -1..=1, warm (R+, B-) when positive.
+    pub temperature: f32,
+    /// -1..=1, green shift when positive.
+    pub tint: f32,
+    /// Drop shadow blur/alpha for `frameImage` (0 = none).
+    pub shadow: u32,
+    /// Resize percentage 25..=100 during `compress`.
+    pub scale_pct: u8,
+    /// `redactImage` fills solid black instead of pixelating.
+    pub redact_solid: bool,
+    pub annotation_color: [u8; 4],
+    pub collage_cols: u32,
+    /// `audioChannels`: mono when true, else stereo.
+    pub mono: bool,
+    /// 0-based page indices for `organizePDF`.
+    pub page_order: Vec<usize>,
 }
 
 impl Default for ToolParams {
@@ -63,6 +81,16 @@ impl Default for ToolParams {
             speed_factor: 2.0,
             start_sec: 0.0,
             end_sec: None,
+            brightness: 0.0,
+            temperature: 0.0,
+            tint: 0.0,
+            shadow: 24,
+            scale_pct: 100,
+            redact_solid: false,
+            annotation_color: [255, 82, 0, 255],
+            collage_cols: 2,
+            mono: true,
+            page_order: vec![],
         }
     }
 }
@@ -198,21 +226,24 @@ fn dispatch(
 ) -> Result<()> {
     let unsupported = || ClementineError::UnsupportedTool(tool_id.to_string());
     match tool_id {
-        "editImage" | "cropImage" | "frameImage" | "redactImage" | "createPDF"
-        | "createCollage" => image_ops::tool(job, tool_id, params, out),
+        "editImage" | "annotateImage" | "cropImage" | "frameImage" | "redactImage"
+        | "createPDF" | "createCollage" => image_ops::tool(job, tool_id, params, out),
         "compress" | "removeMetadata" => {
             if image_ops::is_image_ext(ext) {
                 image_ops::tool(job, tool_id, params, out)
+            } else if ext == "pdf" {
+                doc_ops::clean_pdf(&job[0], out)
             } else if media_ops::is_media_ext(ext) {
                 media_ops::run_tool(job, tool_id, params, out)
             } else {
                 Err(unsupported())
             }
         }
+        "organizePDF" => doc_ops::organize_pdf(&job[0], &params.page_order, out),
         "splitPDF" => doc_ops::split_pdf(&job[0], out),
         "mergePDF" => doc_ops::merge_pdf(job, out),
         "extractArchive" => archive_ops::extract(&job[0], ext, out),
-        "muteVideo" | "trimVideo" | "trimAudio" | "changeVideoSpeed" | "normalizeAudio"
+        "muteVideo" | "trimVideo" | "cropVideo" | "redactVideo" | "trimAudio" | "changeVideoSpeed" | "normalizeAudio"
         | "audioChannels" | "audioToVideo" | "redactAudio" | "splitVideo" | "joinVideos"
         | "videoSnapshots" => media_ops::run_tool(job, tool_id, params, out),
         _ => Err(unsupported()),
@@ -348,5 +379,56 @@ mod tests {
         assert_eq!((p.quality, p.padding, p.corner_radius), (75, 48, 24));
         assert_eq!(p.bg_color, [255, 255, 255, 255]);
         assert_eq!(p.speed_factor, 2.0);
+        assert_eq!((p.shadow, p.scale_pct, p.collage_cols, p.mono), (24, 100, 2, true));
+    }
+
+    #[test]
+    fn organize_and_clean_pdf() {
+        let d = tempfile::tempdir().unwrap();
+        let a = txt_pdf(d.path(), "a", 120); // 3 pages
+        let text = |p: &Path| String::from_utf8_lossy(&fs::read(p).unwrap()).into_owned();
+        let rev = execute_tool(&[a.clone()], "organizePDF", &ToolParams::default()).unwrap();
+        let s = text(&rev);
+        assert!(s.contains("/Count 3"));
+        assert!(s.find("a line 100)").unwrap() < s.find("a line 0)").unwrap());
+        let p = ToolParams { page_order: vec![1], ..Default::default() };
+        let one = text(&execute_tool(&[a.clone()], "organizePDF", &p).unwrap());
+        assert!(one.contains("/Count 1") && one.contains("a line 50)") && !one.contains("a line 0)"));
+        let bad = ToolParams { page_order: vec![9], ..Default::default() };
+        assert!(execute_tool(&[a.clone()], "organizePDF", &bad).is_err());
+        for t in ["compress", "removeMetadata"] {
+            let c = text(&execute_tool(&[a.clone()], t, &ToolParams::default()).unwrap());
+            assert!(c.contains("/Count 3") && !c.contains("/Info") && !c.contains("/Author"));
+        }
+    }
+
+    #[test]
+    fn video_crop_redact_args() {
+        let p = ToolParams { crop_rect: Some((10, 20, 300, 200)), ..Default::default() };
+        let o = Path::new("o.mp4");
+        let i = [PathBuf::from("v.mp4")];
+        let c = media_ops::build_ffmpeg_args(&i, "cropVideo", &p, o).join(" ");
+        assert!(c.ends_with("-vf crop=300:200:10:20 -c:a copy o.mp4"), "{c}");
+        let r = media_ops::build_ffmpeg_args(&i, "redactVideo", &p, o).join(" ");
+        assert!(r.ends_with("-vf drawbox=x=10:y=20:w=300:h=200:color=black@1:t=fill -c:a copy o.mp4"), "{r}");
+    }
+
+    #[test]
+    fn edit_brightness_temperature_tint() {
+        let d = tempfile::tempdir().unwrap();
+        let src = sample_png(d.path(), "e.png", 20, 20);
+        let base = image::open(&src).unwrap().to_rgba8();
+        let at = |p: ToolParams| {
+            let o = execute_tool(&[src.clone()], "editImage", &p).unwrap();
+            image::open(o).unwrap().to_rgba8().get_pixel(10, 10).0
+        };
+        let b0 = base.get_pixel(10, 10).0;
+        let br = at(ToolParams { brightness: 0.2, ..Default::default() });
+        assert!(br[0] > b0[0] && br[1] > b0[1] && br[2] > b0[2]);
+        let w = at(ToolParams { temperature: 0.5, ..Default::default() });
+        assert!(w[0] > b0[0] && w[2] < b0[2]);
+        let t = at(ToolParams { tint: 0.5, ..Default::default() });
+        assert!(t[1] > b0[1]);
+        assert_eq!(image_ops::apply_photo_edits(&base, &ToolParams::default()), base);
     }
 }

@@ -316,53 +316,69 @@ fn crop(img: &DynamicImage, rect: Option<(u32, u32, u32, u32)>) -> Result<Dynami
     Ok(img.crop_imm(x, y, w, h))
 }
 
-fn edit(img: &DynamicImage, p: &ToolParams) -> DynamicImage {
+/// Exposure, contrast, saturation, brightness, temperature and tint in one pass.
+pub fn apply_photo_edits(img: &RgbaImage, p: &ToolParams) -> RgbaImage {
     let gain = 2f32.powf(p.exposure);
-    let mut out = img.to_rgba8();
+    let mut out = img.clone();
     for px in out.pixels_mut() {
         let mut c = [px.0[0] as f32 * gain, px.0[1] as f32 * gain, px.0[2] as f32 * gain];
         for v in &mut c {
-            *v = (*v - 128.0) * p.contrast + 128.0;
+            *v = (*v - 128.0) * p.contrast + 128.0 + p.brightness * 255.0;
         }
+        c[0] += p.temperature * 40.0;
+        c[2] -= p.temperature * 40.0;
+        c[1] += p.tint * 40.0;
         let luma = 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2];
         for (i, v) in c.iter().enumerate() {
             px.0[i] = (luma + (v - luma) * p.saturation).clamp(0.0, 255.0) as u8;
         }
     }
-    DynamicImage::ImageRgba8(out)
+    out
 }
 
-fn frame(img: &DynamicImage, p: &ToolParams) -> DynamicImage {
-    let (w, h) = (img.width(), img.height());
+/// Background canvas with padding, rounded card and blurred drop shadow.
+pub fn apply_frame_bg(img: &RgbaImage, p: &ToolParams) -> RgbaImage {
+    let (w, h) = img.dimensions();
     let pad = p.padding;
     let (cw, ch) = (w + 2 * pad, h + 2 * pad);
     let mut canvas = RgbaImage::from_pixel(cw, ch, Rgba(p.bg_color));
-    let mut shadow = RgbaImage::new(cw, ch);
-    let dy = 8;
-    for y in 0..h {
-        for x in 0..w {
-            if inside_round(x, y, w, h, p.corner_radius) && pad + y + dy < ch {
-                shadow.put_pixel(pad + x, pad + y + dy, Rgba([0, 0, 0, 90]));
+    if p.shadow > 0 {
+        let alpha = (p.shadow * 15 / 4).min(255) as u8;
+        let mut shadow = RgbaImage::new(cw, ch);
+        let dy = 8;
+        for y in 0..h {
+            for x in 0..w {
+                if inside_round(x, y, w, h, p.corner_radius) && pad + y + dy < ch {
+                    shadow.put_pixel(pad + x, pad + y + dy, Rgba([0, 0, 0, alpha]));
+                }
             }
         }
+        imageops::overlay(&mut canvas, &imageops::blur(&shadow, p.shadow as f32 / 2.4), 0, 0);
     }
-    imageops::overlay(&mut canvas, &imageops::blur(&shadow, 10.0), 0, 0);
-    let mut card = img.to_rgba8();
+    let mut card = img.clone();
     round_corners(&mut card, p.corner_radius);
     imageops::overlay(&mut canvas, &card, pad as i64, pad as i64);
-    DynamicImage::ImageRgba8(canvas)
+    canvas
 }
 
-fn redact(img: &DynamicImage, rect: Option<(u32, u32, u32, u32)>) -> Result<DynamicImage> {
+fn redact(img: &DynamicImage, p: &ToolParams) -> Result<DynamicImage> {
     const BLOCK: u32 = 16;
     let (iw, ih) = (img.width(), img.height());
-    let (rx, ry, rw, rh) = rect.unwrap_or((iw / 4, ih / 4, iw / 2, ih / 2));
+    let (rx, ry, rw, rh) = p.crop_rect.unwrap_or((iw / 4, ih / 4, iw / 2, ih / 2));
     let (rx, ry) = (rx.min(iw), ry.min(ih));
     let (rw, rh) = (rw.min(iw - rx), rh.min(ih - ry));
     if rw == 0 || rh == 0 {
         return Err(ClementineError::InvalidInput("empty redact area".into()));
     }
     let mut out = img.to_rgba8();
+    if p.redact_solid {
+        for y in ry..ry + rh {
+            for x in rx..rx + rw {
+                out.put_pixel(x, y, Rgba([0, 0, 0, 255]));
+            }
+        }
+        return Ok(DynamicImage::ImageRgba8(out));
+    }
     for by in (ry..ry + rh).step_by(BLOCK as usize) {
         for bx in (rx..rx + rw).step_by(BLOCK as usize) {
             let (bw, bh) = (BLOCK.min(rx + rw - bx), BLOCK.min(ry + rh - by));
@@ -386,11 +402,85 @@ fn redact(img: &DynamicImage, rect: Option<(u32, u32, u32, u32)>) -> Result<Dyna
     Ok(DynamicImage::ImageRgba8(out))
 }
 
+fn stamp(img: &mut RgbaImage, cx: f32, cy: f32, r: f32, c: [u8; 4]) {
+    let (w, h) = img.dimensions();
+    let x0 = (cx - r).floor().max(0.0) as u32;
+    let x1 = ((cx + r).ceil().max(0.0) as u32).min(w - 1);
+    let y0 = (cy - r).floor().max(0.0) as u32;
+    let y1 = ((cy + r).ceil().max(0.0) as u32).min(h - 1);
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            if (x as f32 - cx).powi(2) + (y as f32 - cy).powi(2) <= r * r {
+                img.put_pixel(x, y, Rgba(c));
+            }
+        }
+    }
+}
+
+fn line(img: &mut RgbaImage, a: (f32, f32), b: (f32, f32), r: f32, c: [u8; 4]) {
+    let steps = ((b.0 - a.0).abs().max((b.1 - a.1).abs()).ceil() as u32).max(1);
+    for i in 0..=steps {
+        let t = i as f32 / steps as f32;
+        stamp(img, a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t, r, c);
+    }
+}
+
+/// Thick callout rectangle plus a diagonal pointer arrow ending at its top-left corner.
+fn annotate(img: &DynamicImage, p: &ToolParams) -> Result<DynamicImage> {
+    let mut out = img.to_rgba8();
+    let (iw, ih) = out.dimensions();
+    let (x, y, w, h) = p.crop_rect.unwrap_or((iw / 4, ih / 4, iw / 2, ih / 2));
+    if w == 0 || h == 0 || x >= iw || y >= ih {
+        return Err(ClementineError::InvalidInput("empty annotation area".into()));
+    }
+    let r = (iw.min(ih) as f32 / 200.0).max(1.5);
+    let (x0, y0) = (x as f32, y as f32);
+    let (x1, y1) = (((x + w).min(iw) - 1) as f32, ((y + h).min(ih) - 1) as f32);
+    let c = p.annotation_color;
+    for (a, b) in [((x0, y0), (x1, y0)), ((x1, y0), (x1, y1)), ((x1, y1), (x0, y1)), ((x0, y1), (x0, y0))] {
+        line(&mut out, a, b, r, c);
+    }
+    let d = iw.min(ih) as f32 / 6.0;
+    let tail = ((x0 - d).max(r), (y0 - d).max(r));
+    let tip = (x0, y0);
+    line(&mut out, tail, tip, r, c);
+    let (dx, dy) = (tip.0 - tail.0, tip.1 - tail.1);
+    let len = (dx * dx + dy * dy).sqrt().max(1.0);
+    let (ux, uy) = (dx / len, dy / len);
+    let head = (len / 3.0).min(d / 2.0).max(r * 4.0);
+    for ang in [0.5f32, -0.5] {
+        let (s, co) = ang.sin_cos();
+        let (bx, by) = (-(ux * co - uy * s), -(ux * s + uy * co));
+        line(&mut out, tip, (tip.0 + bx * head, tip.1 + by * head), r, c);
+    }
+    Ok(DynamicImage::ImageRgba8(out))
+}
+
+/// Resizes by `scale_pct` and, for PNG at quality < 90, quantizes color levels.
+fn shrink(mut img: DynamicImage, ext: &str, p: &ToolParams) -> DynamicImage {
+    let pct = p.scale_pct.clamp(25, 100) as u32;
+    if pct < 100 {
+        let (w, h) = ((img.width() * pct / 100).max(1), (img.height() * pct / 100).max(1));
+        img = img.resize_exact(w, h, Resize::Lanczos3);
+    }
+    if ext == "png" && p.quality < 90 {
+        let step = ((100 - p.quality as u32) / 8).max(1);
+        let mut rgba = img.to_rgba8();
+        for px in rgba.pixels_mut() {
+            for c in &mut px.0[..3] {
+                *c = ((*c as u32 + step / 2) / step * step).min(255) as u8;
+            }
+        }
+        img = DynamicImage::ImageRgba8(rgba);
+    }
+    img
+}
+
 fn collage(imgs: &[DynamicImage], p: &ToolParams) -> DynamicImage {
     const CELL: u32 = 400;
     const GAP: u32 = 24;
     let n = imgs.len() as u32;
-    let cols = (n as f32).sqrt().ceil() as u32;
+    let cols = p.collage_cols.clamp(1, n.max(1));
     let rows = n.div_ceil(cols);
     let mut canvas = RgbaImage::from_pixel(
         cols * CELL + (cols + 1) * GAP,
@@ -429,11 +519,13 @@ pub fn tool(job: &[PathBuf], tool_id: &str, p: &ToolParams, out: &Path) -> Resul
         _ => {
             let img = load(&job[0])?;
             let img = match tool_id {
-                "compress" | "removeMetadata" => img,
+                "compress" => shrink(img, &ext, p),
+                "removeMetadata" => img,
                 "cropImage" => crop(&img, p.crop_rect)?,
-                "editImage" => edit(&img, p),
-                "frameImage" => frame(&img, p),
-                "redactImage" => redact(&img, p.crop_rect)?,
+                "editImage" => DynamicImage::ImageRgba8(apply_photo_edits(&img.to_rgba8(), p)),
+                "frameImage" => DynamicImage::ImageRgba8(apply_frame_bg(&img.to_rgba8(), p)),
+                "redactImage" => redact(&img, p)?,
+                "annotateImage" => annotate(&img, p)?,
                 other => return Err(ClementineError::UnsupportedTool(other.into())),
             };
             write_image(&img, &ext, out, if tool_id == "compress" { p.quality } else { 90 })
@@ -560,5 +652,34 @@ mod tests {
         assert_eq!(pages, 3 + 1); // three pages plus the /Type /Pages node
         let col = execute_tool(&[a, b, c], "createCollage", &ToolParams::default()).unwrap();
         assert_eq!(dims(&col), (2 * 400 + 3 * 24, 2 * 400 + 3 * 24));
+    }
+
+    #[test]
+    fn annotate_draws_color() {
+        let d = tempfile::tempdir().unwrap();
+        let src = sample_png(d.path(), "a.png", 200, 100);
+        let p = ToolParams { annotation_color: [1, 2, 3, 255], ..Default::default() };
+        let out = execute_tool(&[src.clone()], "annotateImage", &p).unwrap();
+        assert_eq!(out.extension().unwrap(), "png");
+        let (o, a) = (image::open(&src).unwrap().to_rgba8(), image::open(&out).unwrap().to_rgba8());
+        assert_eq!(a.get_pixel(100, 25).0, [1, 2, 3, 255]);
+        assert_ne!(o.get_pixel(100, 25), a.get_pixel(100, 25));
+        assert_eq!(o.get_pixel(100, 50), a.get_pixel(100, 50));
+    }
+
+    #[test]
+    fn compress_scale_and_redact_solid() {
+        let d = tempfile::tempdir().unwrap();
+        let src = sample_png(d.path(), "a.png", 200, 200);
+        let p = ToolParams { quality: 20, scale_pct: 50, ..Default::default() };
+        let c = execute_tool(&[src.clone()], "compress", &p).unwrap();
+        assert_eq!(dims(&c), (100, 100));
+        let p = ToolParams { quality: 20, ..Default::default() };
+        let c2 = execute_tool(&[src.clone()], "compress", &p).unwrap();
+        assert!(fs::metadata(&c2).unwrap().len() < fs::metadata(&src).unwrap().len());
+        let p = ToolParams { redact_solid: true, crop_rect: Some((10, 10, 20, 20)), ..Default::default() };
+        let r = image::open(execute_tool(&[src], "redactImage", &p).unwrap()).unwrap().to_rgba8();
+        assert_eq!(r.get_pixel(15, 15).0, [0, 0, 0, 255]);
+        assert_ne!(r.get_pixel(40, 40).0, [0, 0, 0, 255]);
     }
 }

@@ -448,6 +448,28 @@ pub fn merge_pdf(srcs: &[std::path::PathBuf], out: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Reorders/filters pages by 0-based `order`; empty reverses the page order.
+pub fn organize_pdf(src: &Path, order: &[usize], out: &Path) -> Result<()> {
+    let pages = pdf_pages(&fs::read(src)?)?;
+    let order: Vec<usize> =
+        if order.is_empty() { (0..pages.len()).rev().collect() } else { order.to_vec() };
+    let mut picked = Vec::new();
+    for i in order {
+        let p = pages.get(i).ok_or_else(|| {
+            ClementineError::InvalidInput(format!("page {i} out of range ({} pages)", pages.len()))
+        })?;
+        picked.push(PdfPage { w: p.w, h: p.h, content: p.content.clone(), jpeg: p.jpeg.clone() });
+    }
+    fs::write(out, build_pdf(&picked))?;
+    Ok(())
+}
+
+/// Re-serializes pages into a clean PDF (build_pdf writes no /Info dictionary).
+pub fn clean_pdf(src: &Path, out: &Path) -> Result<()> {
+    fs::write(out, build_pdf(&pdf_pages(&fs::read(src)?)?))?;
+    Ok(())
+}
+
 // ------------------------------------------------------------------ XLSX
 
 fn xlsx(rows: &[Vec<String>]) -> Result<Vec<u8>> {

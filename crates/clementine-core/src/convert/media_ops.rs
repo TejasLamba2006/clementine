@@ -105,7 +105,18 @@ pub fn build_ffmpeg_args(inputs: &[PathBuf], op: &str, params: &ToolParams, out:
             ]));
         }
         "normalizeAudio" => a.extend(s(&["-af", "loudnorm=I=-16:TP=-1.5:LRA=11"])),
-        "audioChannels" => a.extend(s(&["-ac", "1"])),
+        "audioChannels" => a.extend(s(&["-ac", if params.mono { "1" } else { "2" }])),
+        "cropVideo" | "redactVideo" => {
+            let vf = match (op, params.crop_rect) {
+                ("cropVideo", Some((x, y, w, h))) => format!("crop={w}:{h}:{x}:{y}"),
+                ("cropVideo", None) => "crop=trunc(iw*0.8/2)*2:trunc(ih*0.8/2)*2".into(),
+                (_, Some((x, y, w, h))) => {
+                    format!("drawbox=x={x}:y={y}:w={w}:h={h}:color=black@1:t=fill")
+                }
+                (_, None) => "drawbox=x=iw/4:y=ih/4:w=iw/2:h=ih/2:color=black@1:t=fill".into(),
+            };
+            a.extend(s(&["-vf", &vf, "-c:a", "copy"]));
+        }
         "audioToVideo" => a.extend(s(&[
             "-filter_complex",
             "[0:a]showwaves=s=1280x720:mode=cline,format=yuv420p[v]",
