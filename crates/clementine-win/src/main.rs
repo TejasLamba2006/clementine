@@ -112,21 +112,30 @@ fn refresh_targets(w: &mut Wheel) {
     rerender(w);
 }
 
-fn present(hwnd: HWND, w: &Wheel) {
-    let t = ((w.t0.elapsed().as_secs_f64() * 1000.0) / BLOOM_MS).min(1.0);
+fn present_hwnd(hwnd: HWND) {
+    let snap = W.with(|c| {
+        let g = c.borrow();
+        let w = g.as_ref()?;
+        Some((w.t0, w.cx, w.cy, w.frame.clone()))
+    });
+    let Some((t0, cx, cy, frame)) = snap else { return };
+    if frame.len() < SIZE * SIZE {
+        return;
+    }
+    let t = ((t0.elapsed().as_secs_f64() * 1000.0) / BLOOM_MS).min(1.0);
     let e = bloom_ease(t);
     let (scale, alpha) = (0.45 + 0.55 * e, e);
     let mut d = Dib::new();
     let out = d.slice();
     if t >= 1.0 {
-        out.copy_from_slice(&w.frame);
+        out.copy_from_slice(&frame);
     } else {
         for y in 0..SIZE {
             for x in 0..SIZE {
                 let sx = ((x as f64 - 136.0) / scale + 136.0).round();
                 let sy = ((y as f64 - 136.0) / scale + 136.0).round();
                 out[y * SIZE + x] = if sx >= 0.0 && sy >= 0.0 && sx < SIZE as f64 && sy < SIZE as f64 {
-                    w.frame[sy as usize * SIZE + sx as usize]
+                    frame[sy as usize * SIZE + sx as usize]
                 } else {
                     0
                 };
@@ -135,7 +144,7 @@ fn present(hwnd: HWND, w: &Wheel) {
     }
     unsafe {
         let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: (alpha * 255.0) as u8, AlphaFormat: AC_SRC_ALPHA as u8 };
-        let pt = POINT { x: w.cx - 136, y: w.cy - 136 };
+        let pt = POINT { x: cx - 136, y: cy - 136 };
         let sz = SIZE { cx: S, cy: S };
         let src = POINT { x: 0, y: 0 };
         UpdateLayeredWindow(hwnd, std::ptr::null_mut(), &pt, &sz, d.dc, &src, 0, &blend, ULW_ALPHA);
@@ -168,14 +177,15 @@ fn clipboard_paths(hwnd: HWND) -> Vec<PathBuf> {
 fn open_wheel(hwnd: HWND, mode: WheelMode, demo: bool) {
     let mut pt = POINT { x: 0, y: 0 };
     unsafe { GetCursorPos(&mut pt) };
-    W.with(|c| {
+    let clip = clipboard_paths(hwnd);
+    let (was_open, cx, cy) = W.with(|c| {
         let mut g = c.borrow_mut();
         let w = g.as_mut().unwrap();
         let was_open = w.open;
         w.mode = mode;
         if !was_open {
             if w.paths.is_empty() {
-                w.paths = clipboard_paths(hwnd);
+                w.paths = clip;
             }
             w.cx = pt.x;
             w.cy = pt.y;
@@ -187,25 +197,21 @@ fn open_wheel(hwnd: HWND, mode: WheelMode, demo: bool) {
             }
         }
         refresh_targets(w);
-        unsafe {
-            if !was_open {
-                let ring = CreateEllipticRgn(10, 10, 262, 262);
-                let hole = CreateEllipticRgn(94, 94, 178, 178);
-                CombineRgn(ring, ring, hole, RGN_DIFF);
-                DeleteObject(hole);
-                SetWindowRgn(hwnd, ring, 0);
-                SetWindowPos(hwnd, HWND_TOPMOST, w.cx - 136, w.cy - 136, S, S, SWP_NOACTIVATE);
-                present(hwnd, w);
-                ShowWindow(hwnd, SW_SHOWNA);
-                SetTimer(hwnd, TIMER_ID, 16, None);
-                // Nudge so an in-flight DoDragDrop fires DragEnter without waiting for real movement.
-                SetCursorPos(pt.x + 1, pt.y);
-                SetCursorPos(pt.x, pt.y);
-            } else {
-                present(hwnd, w);
-            }
-        }
+        (was_open, w.cx, w.cy)
     });
+    unsafe {
+        if !was_open {
+            SetWindowPos(hwnd, HWND_TOPMOST, cx - 136, cy - 136, S, S, SWP_NOACTIVATE);
+            present_hwnd(hwnd);
+            ShowWindow(hwnd, SW_SHOWNA);
+            SetTimer(hwnd, TIMER_ID, 16, None);
+            // Nudge so an in-flight DoDragDrop fires DragEnter without waiting for real movement.
+            SetCursorPos(pt.x + 1, pt.y);
+            SetCursorPos(pt.x, pt.y);
+        } else {
+            present_hwnd(hwnd);
+        }
+    }
 }
 
 fn close_wheel(hwnd: HWND) {
@@ -220,24 +226,28 @@ fn close_wheel(hwnd: HWND) {
         KillTimer(hwnd, TIMER_CLOSE_ID);
         KillTimer(hwnd, TIMER_DEMO_ID);
         ShowWindow(hwnd, SW_HIDE);
-        SetWindowRgn(hwnd, std::ptr::null_mut(), 0);
     }
 }
 
 fn select_at(hwnd: HWND, sx: i32, sy: i32) {
-    W.with(|c| {
+    let changed = W.with(|c| {
         let mut g = c.borrow_mut();
-        let Some(w) = g.as_mut().filter(|w| w.open) else { return };
+        let Some(w) = g.as_mut().filter(|w| w.open) else { return None };
         let sel = hit_test_petal((sx - w.cx) as f64, (sy - w.cy) as f64, w.labels.len());
         if sel != w.selected {
             w.selected = sel;
             rerender(w);
-            present(hwnd, w);
-            if sel.is_some() {
-                unsafe { PlaySoundW(CLICK_WAV.as_ptr() as _, std::ptr::null_mut(), SND_MEMORY | SND_ASYNC | SND_NODEFAULT) };
-            }
+            Some(sel.is_some())
+        } else {
+            None
         }
     });
+    if let Some(play) = changed {
+        present_hwnd(hwnd);
+        if play {
+            unsafe { PlaySoundW(CLICK_WAV.as_ptr() as _, std::ptr::null_mut(), SND_MEMORY | SND_ASYNC | SND_NODEFAULT) };
+        }
+    }
 }
 
 fn commit(hwnd: HWND) {
@@ -283,15 +293,19 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM) -
             0
         }
         WM_APP_ENTER => {
-            W.with(|c| {
+            let open = W.with(|c| {
                 if let Some(w) = c.borrow_mut().as_mut() {
                     w.paths = PATHS.lock().unwrap().clone();
                     if w.open {
                         refresh_targets(w);
-                        present(hwnd, w);
+                        return true;
                     }
                 }
+                false
             });
+            if open {
+                present_hwnd(hwnd);
+            }
             select_at(hwnd, x, y);
             0
         }
@@ -404,11 +418,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM) -
         WM_TIMER => {
             let (open, bloom, demo_over) = W.with(|c| {
                 let g = c.borrow();
-                let w = g.as_ref().unwrap();
+                let Some(w) = g.as_ref() else { return (false, false, false) };
                 (w.open, w.t0.elapsed().as_secs_f64() * 1000.0 < BLOOM_MS + 32.0, w.demo_until.is_some_and(|d| Instant::now() >= d))
             });
             if open && bloom {
-                W.with(|c| present(hwnd, c.borrow().as_ref().unwrap()));
+                present_hwnd(hwnd);
             }
             if demo_over || (GetAsyncKeyState(VK_ESCAPE as i32) as u16 & 0x8000 != 0 && W.with(|c| c.borrow().as_ref().is_some_and(|w| w.demo_until.is_some()))) {
                 close_wheel(hwnd);
@@ -427,29 +441,6 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM) -
 fn create_window() -> HWND {
     unsafe {
         OleInitialize(std::ptr::null());
-        let hi = GetModuleHandleW(std::ptr::null());
-        let class = w16("ClementineWheel");
-        let wc = WNDCLASSW {
-            style: 0,
-            lpfnWndProc: Some(wnd_proc),
-            cbClsExtra: 0,
-            cbWndExtra: 0,
-            hInstance: hi,
-            hIcon: load_icon(),
-            hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
-            hbrBackground: std::ptr::null_mut(),
-            lpszMenuName: std::ptr::null(),
-            lpszClassName: class.as_ptr(),
-        };
-        RegisterClassW(&wc);
-        let h = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            class.as_ptr(),
-            class.as_ptr(),
-            WS_POPUP,
-            0, 0, S, S,
-            std::ptr::null_mut(), std::ptr::null_mut(), hi, std::ptr::null(),
-        );
         W.with(|c| {
             *c.borrow_mut() = Some(Wheel {
                 open: false,
@@ -468,7 +459,29 @@ fn create_window() -> HWND {
                 t0: Instant::now(),
             })
         });
-        h
+        let hi = GetModuleHandleW(std::ptr::null());
+        let class = w16("ClementineWheel");
+        let wc = WNDCLASSW {
+            style: 0,
+            lpfnWndProc: Some(wnd_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hi,
+            hIcon: load_icon(),
+            hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
+            hbrBackground: std::ptr::null_mut(),
+            lpszMenuName: std::ptr::null(),
+            lpszClassName: class.as_ptr(),
+        };
+        RegisterClassW(&wc);
+        CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            class.as_ptr(),
+            class.as_ptr(),
+            WS_POPUP,
+            0, 0, S, S,
+            std::ptr::null_mut(), std::ptr::null_mut(), hi, std::ptr::null(),
+        )
     }
 }
 
@@ -527,7 +540,7 @@ fn tour_tick(hwnd: HWND) {
         return;
     }
     let (mode, petals) = TOUR[step / 4];
-    W.with(|c| {
+    let target_pt = W.with(|c| {
         let mut g = c.borrow_mut();
         let w = g.as_mut().unwrap();
         if w.mode != mode {
@@ -535,23 +548,107 @@ fn tour_tick(hwnd: HWND) {
             refresh_targets(w);
         }
         if w.labels.is_empty() {
-            return;
+            return None;
         }
-        w.selected = Some(petals[step % 4].min(w.labels.len() - 1));
+        let idx = petals[step % 4].min(w.labels.len() - 1);
+        w.selected = Some(idx);
+        let lp = clementine_core::label_position(idx, w.labels.len());
         rerender(w);
-        present(hwnd, w);
+        Some((w.cx + lp.x.round() as i32, w.cy + lp.y.round() as i32))
     });
+    if let Some((tx, ty)) = target_pt {
+        present_hwnd(hwnd);
+        unsafe {
+            SetCursorPos(tx, ty);
+            PlaySoundW(CLICK_WAV.as_ptr() as _, std::ptr::null_mut(), SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+        }
+    }
+}
+
+fn create_stage_window(cx: i32, cy: i32) -> HWND {
+    const SW: usize = 800;
+    const SH: usize = 540;
+    unsafe {
+        let hi = GetModuleHandleW(std::ptr::null());
+        let class = w16("ClementineStage");
+        let wc = WNDCLASSW {
+            style: 0,
+            lpfnWndProc: Some(DefWindowProcW),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hi,
+            hIcon: std::ptr::null_mut(),
+            hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
+            hbrBackground: std::ptr::null_mut(),
+            lpszMenuName: std::ptr::null(),
+            lpszClassName: class.as_ptr(),
+        };
+        RegisterClassW(&wc);
+        let hwnd = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            class.as_ptr(),
+            class.as_ptr(),
+            WS_POPUP,
+            cx - (SW as i32) / 2,
+            cy - (SH as i32) / 2,
+            SW as i32,
+            SH as i32,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            hi,
+            std::ptr::null(),
+        );
+        let mut d = Dib::sized(SW, SH);
+        let buf = d.slice();
+        for y in 0..SH {
+            let v = y as f32 / (SH - 1) as f32;
+            for x in 0..SW {
+                let u = x as f32 / (SW - 1) as f32;
+                // Warm sunset gradient matching Tangerine press kit (#F3A528 -> #F45B3E -> #9782C6)
+                let w1 = (1.0 - u) * (1.0 - v);
+                let w2 = (1.0 - u) * v;
+                let w3 = u * (1.0 - v);
+                let w4 = u * v;
+                let mut r = (246.0 * w1 + 247.0 * w2 + 214.0 * w3 + 158.0 * w4).clamp(0.0, 255.0);
+                let mut g = (176.0 * w1 + 92.0 * w2 + 128.0 * w3 + 132.0 * w4).clamp(0.0, 255.0);
+                let mut b = (38.0 * w1 + 66.0 * w2 + 64.0 * w3 + 202.0 * w4).clamp(0.0, 255.0);
+                // Subtle center file card (64x64 rounded square) peeking inside the wheel hole
+                let dx = (x as f32 - (SW as f32 * 0.5 - 10.0)).abs();
+                let dy = (y as f32 - (SH as f32 * 0.5)).abs();
+                if dx < 30.0 && dy < 34.0 {
+                    r = 255.0;
+                    g = 246.0;
+                    b = 238.0;
+                    if dx < 26.0 && dy < 30.0 {
+                        r = 255.0;
+                        g = 118.0;
+                        b = 38.0;
+                    }
+                }
+                buf[y * SW + x] = (255u32 << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+            }
+        }
+        let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
+        let pt = POINT { x: cx - (SW as i32) / 2, y: cy - (SH as i32) / 2 };
+        let sz = SIZE { cx: SW as i32, cy: SH as i32 };
+        let src = POINT { x: 0, y: 0 };
+        UpdateLayeredWindow(hwnd, std::ptr::null_mut(), &pt, &sz, d.dc, &src, 0, &blend, ULW_ALPHA);
+        ShowWindow(hwnd, SW_SHOWNA);
+        hwnd
+    }
 }
 
 fn live_tour() {
     let h = create_window();
     unsafe {
         let (cx, cy) = (GetSystemMetrics(SM_CXSCREEN) / 2, GetSystemMetrics(SM_CYSCREEN) / 2);
+        let stage = create_stage_window(cx, cy);
         SetCursorPos(cx, cy);
         open_wheel(h, WheelMode::Conversions, false);
         SetTimer(h, TIMER_TOUR_ID, 350, None);
+        message_loop();
+        DestroyWindow(stage);
     }
-    message_loop();
 }
 
 fn add_tray(hwnd: HWND) {
