@@ -7,6 +7,7 @@ mod install;
 mod renderer;
 mod shelf;
 mod showcase;
+mod tool_window;
 
 use clementine_core::*;
 use drop_target::*;
@@ -33,6 +34,8 @@ const TIMER_CLOSE_ID: usize = 2;
 const TIMER_DEMO_ID: usize = 3;
 const TIMER_TOUR_ID: usize = 4;
 const TIMER_PROGRESS_ID: usize = 5;
+const TIMER_REC_ID: usize = 6;
+const CAPTUREBLT_FLAG: u32 = 0x4000_0000;
 const PROGRESS_MS: f64 = 520.0;
 const HOLD_MS: f64 = 320.0;
 const WM_APP_TRAY: u32 = WM_APP + 20;
@@ -68,6 +71,95 @@ struct Wheel {
 thread_local! {
     static W: RefCell<Option<Wheel>> = const { RefCell::new(None) };
     static TOUR_STEP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TOUR_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    static REC_FRAME: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static REC_ZOOM: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0) };
+}
+
+pub fn record_real_desktop_frame(target_zoom: f32) {
+    let active = TOUR_DIR.with(|d| d.borrow().is_some());
+    if !active {
+        return;
+    }
+    let z_prev = REC_ZOOM.with(|z| z.get());
+    let z = z_prev + (target_zoom - z_prev) * 0.18;
+    REC_ZOOM.with(|zv| zv.set(z));
+    let idx = REC_FRAME.with(|f| {
+        let v = f.get();
+        f.set(v + 1);
+        v
+    });
+    const CW: usize = 1280;
+    const CH: usize = 800;
+    const OW: usize = 960;
+    const OH: usize = 640;
+    unsafe {
+        let (cx, cy) = (GetSystemMetrics(SM_CXSCREEN) / 2, GetSystemMetrics(SM_CYSCREEN) / 2);
+        let ox = cx - (CW as i32) / 2;
+        let oy = cy - (CH as i32) / 2;
+        let sdc = GetDC( std::ptr::null_mut());
+        if sdc.is_null() {
+            return;
+        }
+        let mut d = Dib::sized(CW, CH);
+        let _ = BitBlt(d.dc, 0, 0, CW as i32, CH as i32, sdc, ox, oy, SRCCOPY | CAPTUREBLT_FLAG);
+        ReleaseDC(std::ptr::null_mut(), sdc);
+        let mut pt = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut pt);
+        let mx = pt.x - ox;
+        let my = pt.y - oy;
+        let src = d.slice();
+        // Draw crisp black arrow cursor with white border into captured desktop buffer
+        for dy in 0..22i32 {
+            for dx in 0..16i32 {
+                let (px, py) = (mx + dx, my + dy);
+                if px < 0 || py < 0 || px >= CW as i32 || py >= CH as i32 {
+                    continue;
+                }
+                let in_arrow = (dy <= 15 && dx <= dy && dx <= (dy * 3) / 4 + 1)
+                    || (dy > 15 && dy <= 20 && dx >= (dy - 10) / 2 && dx <= (dy - 10) / 2 + 3);
+                let in_border = (dy <= 16 && dx <= dy + 1 && dx <= (dy * 3) / 4 + 2)
+                    || (dy > 16 && dy <= 21 && dx >= (dy - 10) / 2 - 1 && dx <= (dy - 10) / 2 + 4);
+                if in_arrow {
+                    src[py as usize * CW + px as usize] = 0xFF14_1414;
+                } else if in_border {
+                    src[py as usize * CW + px as usize] = 0xFFFF_FFFF;
+                }
+            }
+        }
+        let mut out = image::RgbImage::new(OW as u32, OH as u32);
+        let fcx = CW as f32 * 0.5;
+        let fcy = CH as f32 * 0.5;
+        let view_w = (CW as f32) / z;
+        let view_h = (CH as f32) / z;
+        let sample = |ix: i32, iy: i32| -> [f32; 3] {
+            let v = src[iy.clamp(0, CH as i32 - 1) as usize * CW + ix.clamp(0, CW as i32 - 1) as usize];
+            [((v >> 16) & 255) as f32, ((v >> 8) & 255) as f32, (v & 255) as f32]
+        };
+        for y in 0..OH {
+            let fy = fcy - view_h * 0.5 + ((y as f32 + 0.5) / OH as f32) * view_h - 0.5;
+            let y0 = fy.floor() as i32;
+            let ty = fy - y0 as f32;
+            for x in 0..OW {
+                let fx = fcx - view_w * 0.5 + ((x as f32 + 0.5) / OW as f32) * view_w - 0.5;
+                let x0 = fx.floor() as i32;
+                let tx = fx - x0 as f32;
+                let p00 = sample(x0, y0);
+                let p10 = sample(x0 + 1, y0);
+                let p01 = sample(x0, y0 + 1);
+                let p11 = sample(x0 + 1, y0 + 1);
+                let mut rgb = [0u8; 3];
+                for c in 0..3 {
+                    let top = p00[c] + (p10[c] - p00[c]) * tx;
+                    let bot = p01[c] + (p11[c] - p01[c]) * tx;
+                    rgb[c] = (top + (bot - top) * ty).round().clamp(0.0, 255.0) as u8;
+                }
+                out.put_pixel(x as u32, y as u32, image::Rgb(rgb));
+            }
+        }
+        let _ = std::fs::create_dir_all("target/real-tour");
+        let _ = out.save(format!("target/real-tour/frame_{idx:04}.png"));
+    }
 }
 
 fn w16(s: &str) -> Vec<u16> {
@@ -306,13 +398,31 @@ fn commit(hwnd: HWND) {
                 }
             }
         }
-        WheelMode::Tools => match execute_tool(&paths, &id, &ToolParams::default()) {
-            Ok(o) => {
-                println!("wrote {}", o.display());
-                outs.push(o);
+        WheelMode::Tools => {
+            let params = if matches!(id.as_str(), "muteVideo" | "splitPDF" | "extractArchive" | "createPDF") {
+                ToolParams::default()
+            } else {
+                unsafe {
+                    KillTimer(hwnd, TIMER_ID);
+                    KillTimer(hwnd, TIMER_CLOSE_ID);
+                    KillTimer(hwnd, TIMER_DEMO_ID);
+                    ShowWindow(hwnd, SW_HIDE);
+                }
+                let Some(p) = tool_window::run_modal(&id, paths.clone(), None) else {
+                    close_wheel(hwnd);
+                    return quit();
+                };
+                unsafe { ShowWindow(hwnd, SW_SHOWNA) };
+                p
+            };
+            match execute_tool(&paths, &id, &params) {
+                Ok(o) => {
+                    println!("wrote {}", o.display());
+                    outs.push(o);
+                }
+                Err(e) => eprintln!("tool failed: {e}"),
             }
-            Err(e) => eprintln!("tool failed: {e}"),
-        },
+        }
     }
     let Some(last) = outs.last() else {
         close_wheel(hwnd);
@@ -461,6 +571,15 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM) -
         }
         WM_TIMER if wp == TIMER_PROGRESS_ID => {
             progress_tick(hwnd);
+            0
+        }
+        WM_TIMER if wp == TIMER_REC_ID => {
+            let z = W.with(|c| {
+                let g = c.borrow();
+                let Some(w) = g.as_ref() else { return 1.0 };
+                if w.progress.is_some() { 1.32 } else if w.open { 1.24 } else { 1.0 }
+            });
+            record_real_desktop_frame(z);
             0
         }
         WM_TIMER if wp == TIMER_TOUR_ID => {
@@ -637,9 +756,165 @@ const TOUR: [(WheelMode, [usize; 4]); 3] = [
     (WheelMode::Actions, [0, 1, 2, 5]),
 ];
 
-/// One 350ms step of `--live-Tour`: highlight a petal, switching wheel every 4 steps, quit after the last.
+/// One 350ms step of `--live-Tour`.
 fn tour_tick(hwnd: HWND) {
     let step = TOUR_STEP.with(|s| s.replace(s.get() + 1));
+    let dir_opt = TOUR_DIR.with(|d| d.borrow().clone());
+    if let Some(dir) = dir_opt {
+        match step {
+            0..=2 => {
+                let petals = [0usize, 1, 1];
+                let p_file = dir.join("tangerine-tree.png");
+                let pt = W.with(|c| {
+                    let mut g = c.borrow_mut();
+                    let w = g.as_mut().unwrap();
+                    w.progress = None;
+                    w.open = true;
+                    if step == 0 || w.mode != WheelMode::Conversions {
+                        w.mode = WheelMode::Conversions;
+                        w.paths = vec![p_file];
+                        w.base = make_base(capture_screen(w.cx, w.cy).as_deref());
+                        refresh_targets(w);
+                    }
+                    let idx = petals[step].min(w.labels.len().saturating_sub(1));
+                    w.selected = Some(idx);
+                    let lp = clementine_core::label_position(idx, w.labels.len());
+                    rerender(w);
+                    (w.cx + lp.x.round() as i32, w.cy + lp.y.round() as i32)
+                });
+                present_hwnd(hwnd);
+                unsafe {
+                    ShowWindow(hwnd, SW_SHOWNA);
+                    SetCursorPos(pt.0, pt.1);
+                    PlaySoundW(CLICK_WAV.as_ptr() as _, std::ptr::null_mut(), SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+                }
+            }
+            3 => {
+                let src = dir.join("tangerine-tree.png");
+                if let Ok(out) = execute_conversion(&src, "webp") {
+                    let name = out.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    start_progress(hwnd, Progress {
+                        title: "CONVERTING TO WEBP".into(),
+                        name: name.clone(),
+                        saved: format!("Saved {name}"),
+                        t0: Instant::now(),
+                        demo: false,
+                    });
+                }
+            }
+            4..=6 => {}
+            7..=9 => {
+                let petals = [0usize, 1, 2];
+                let p_file = dir.join("mountain-sunset.jpg");
+                let pt = W.with(|c| {
+                    let mut g = c.borrow_mut();
+                    let w = g.as_mut().unwrap();
+                    w.progress = None;
+                    w.open = true;
+                    if step == 7 || w.mode != WheelMode::Tools {
+                        w.mode = WheelMode::Tools;
+                        w.paths = vec![p_file];
+                        w.base = make_base(capture_screen(w.cx, w.cy).as_deref());
+                        w.t0 = Instant::now();
+                        refresh_targets(w);
+                    }
+                    let idx = petals[step - 7].min(w.labels.len().saturating_sub(1));
+                    w.selected = Some(idx);
+                    let lp = clementine_core::label_position(idx, w.labels.len());
+                    rerender(w);
+                    (w.cx + lp.x.round() as i32, w.cy + lp.y.round() as i32)
+                });
+                present_hwnd(hwnd);
+                unsafe {
+                    ShowWindow(hwnd, SW_SHOWNA);
+                    SetCursorPos(pt.0, pt.1);
+                    PlaySoundW(CLICK_WAV.as_ptr() as _, std::ptr::null_mut(), SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+                }
+            }
+            10 => {
+                unsafe {
+                    KillTimer(hwnd, TIMER_TOUR_ID);
+                    ShowWindow(hwnd, SW_HIDE);
+                }
+                let src = dir.join("mountain-sunset.jpg");
+                if let Some(params) = tool_window::run_modal("editImage", vec![src.clone()], Some(1500)) {
+                    if let Ok(out) = execute_tool(&[src], "editImage", &params) {
+                        let name = out.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        unsafe { ShowWindow(hwnd, SW_SHOWNA) };
+                        start_progress(hwnd, Progress {
+                            title: "APPLYING EDIT PHOTO".into(),
+                            name: name.clone(),
+                            saved: format!("Saved {name}"),
+                            t0: Instant::now(),
+                            demo: false,
+                        });
+                    }
+                }
+                unsafe { SetTimer(hwnd, TIMER_TOUR_ID, 350, None) };
+            }
+            11..=13 => {}
+            14 => {
+                unsafe {
+                    KillTimer(hwnd, TIMER_TOUR_ID);
+                    ShowWindow(hwnd, SW_HIDE);
+                }
+                let src = dir.join("alpine-lake.jpg");
+                if let Some(params) = tool_window::run_modal("frameImage", vec![src.clone()], Some(1500)) {
+                    if let Ok(out) = execute_tool(&[src], "frameImage", &params) {
+                        let name = out.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        unsafe { ShowWindow(hwnd, SW_SHOWNA) };
+                        start_progress(hwnd, Progress {
+                            title: "ADDING BACKGROUND".into(),
+                            name: name.clone(),
+                            saved: format!("Saved {name}"),
+                            t0: Instant::now(),
+                            demo: false,
+                        });
+                    }
+                }
+                unsafe { SetTimer(hwnd, TIMER_TOUR_ID, 350, None) };
+            }
+            15..=17 => {}
+            18..=20 => {
+                let petals = [0usize, 1, 1];
+                let pt = W.with(|c| {
+                    let mut g = c.borrow_mut();
+                    let w = g.as_mut().unwrap();
+                    w.progress = None;
+                    w.open = true;
+                    if step == 18 || w.mode != WheelMode::Actions {
+                        w.mode = WheelMode::Actions;
+                        w.base = make_base(capture_screen(w.cx, w.cy).as_deref());
+                        w.t0 = Instant::now();
+                        refresh_targets(w);
+                    }
+                    let idx = petals[step - 18].min(w.labels.len().saturating_sub(1));
+                    w.selected = Some(idx);
+                    let lp = clementine_core::label_position(idx, w.labels.len());
+                    rerender(w);
+                    (w.cx + lp.x.round() as i32, w.cy + lp.y.round() as i32)
+                });
+                present_hwnd(hwnd);
+                unsafe {
+                    ShowWindow(hwnd, SW_SHOWNA);
+                    SetCursorPos(pt.0, pt.1);
+                    PlaySoundW(CLICK_WAV.as_ptr() as _, std::ptr::null_mut(), SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+                }
+                if step == 20 {
+                    shelf::add(hwnd, &[dir.join("tangerine-tree.webp"), dir.join("mountain-sunset Edited.jpg")]);
+                }
+            }
+            21..=23 => {}
+            _ => {
+                unsafe {
+                    KillTimer(hwnd, TIMER_TOUR_ID);
+                    PostQuitMessage(0);
+                }
+                close_wheel(hwnd);
+            }
+        }
+        return;
+    }
     if step >= 12 {
         unsafe {
             KillTimer(hwnd, TIMER_TOUR_ID);
@@ -747,16 +1022,30 @@ fn create_stage_window(cx: i32, cy: i32) -> HWND {
     }
 }
 
-fn live_tour() {
+fn live_tour(demo_dir: Option<PathBuf>) {
+    TOUR_DIR.with(|d| *d.borrow_mut() = demo_dir.clone());
     let h = create_window();
     unsafe {
         let (cx, cy) = (GetSystemMetrics(SM_CXSCREEN) / 2, GetSystemMetrics(SM_CYSCREEN) / 2);
-        let stage = create_stage_window(cx, cy);
+        if demo_dir.is_some() {
+            let _ = std::fs::remove_dir_all("target/real-tour");
+            let cab = w16("CabinetWClass");
+            let eh = FindWindowW(cab.as_ptr(), std::ptr::null());
+            if !eh.is_null() {
+                ShowWindow(eh, SW_RESTORE);
+                SetWindowPos(eh, HWND_TOP, cx - 640, cy - 400, 1280, 800, SWP_SHOWWINDOW);
+                SetForegroundWindow(eh);
+            }
+            SetTimer(h, TIMER_REC_ID, 40, None);
+        }
+        let stage = if demo_dir.is_none() { Some(create_stage_window(cx, cy)) } else { None };
         SetCursorPos(cx, cy);
         open_wheel(h, WheelMode::Conversions, false);
         SetTimer(h, TIMER_TOUR_ID, 350, None);
         message_loop();
-        DestroyWindow(stage);
+        if let Some(st) = stage {
+            DestroyWindow(st);
+        }
     }
 }
 
@@ -833,6 +1122,10 @@ fn self_test() -> std::result::Result<(), String> {
     if hud[156 * SIZE + 60] >> 24 == 0 {
         return Err("progress HUD bar missing".into());
     }
+    let tc = tool_window::render_tool_card("editImage", &[]);
+    tool_window::to_modal_image(&tc).save("target/test-tool-edit.png").map_err(|e| e.to_string())?;
+    let tf = tool_window::render_tool_card("frameImage", &[]);
+    tool_window::to_modal_image(&tf).save("target/test-tool-frame.png").map_err(|e| e.to_string())?;
     println!("self-test ok: target/self-test-wheel.png");
     Ok(())
 }
@@ -844,6 +1137,41 @@ fn main() {
             if let Err(e) = self_test() {
                 eprintln!("self-test FAILED: {e}");
                 std::process::exit(1);
+            }
+        }
+        Some("--render-tool-window") => {
+            let out = a.get(2).expect("usage: --render-tool-window <out.png> <tool_id> [file]");
+            let tid = a.get(3).map(|s| s.as_str()).unwrap_or("editImage");
+            let paths: Vec<PathBuf> = a.get(4).map(|p| vec![PathBuf::from(p)]).unwrap_or_default();
+            let px = tool_window::render_tool_card(tid, &paths);
+            tool_window::to_modal_image(&px).save(out).expect("save tool png");
+        }
+        Some("--tool") => {
+            let tid = a.get(2).map(|s| s.as_str()).unwrap_or("editImage");
+            let paths: Vec<PathBuf> = a.get(3).map(|p| vec![PathBuf::from(p)]).unwrap_or_default();
+            let auto_ms = a.get(4).and_then(|s| s.parse::<u32>().ok());
+            if let Some(params) = tool_window::run_modal(tid, paths.clone(), auto_ms) {
+                if !paths.is_empty() {
+                    if let Ok(out) = execute_tool(&paths, tid, &params) {
+                        let name = out.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        let h = create_window();
+                        let (cx, cy) = unsafe { (GetSystemMetrics(SM_CXSCREEN) / 2, GetSystemMetrics(SM_CYSCREEN) / 2) };
+                        W.with(|c| {
+                            if let Some(w) = c.borrow_mut().as_mut() {
+                                w.cx = cx;
+                                w.cy = cy;
+                                w.base = make_base(capture_screen(cx, cy).as_deref());
+                            }
+                        });
+                        unsafe {
+                            SetWindowPos(h, HWND_TOPMOST, cx - 136, cy - 136, S, S, SWP_NOACTIVATE);
+                            ShowWindow(h, SW_SHOWNA);
+                        }
+                        let t = tool_meta(tid).map(|m| m.title.to_ascii_uppercase()).unwrap_or_else(|| tid.to_ascii_uppercase());
+                        start_progress(h, Progress { title: format!("APPLYING {t}"), name: name.clone(), saved: format!("Saved {name}"), t0: Instant::now(), demo: true });
+                        message_loop();
+                    }
+                }
             }
         }
         Some("--render-wheel") => {
@@ -873,6 +1201,13 @@ fn main() {
         Some("--demo") => {
             let h = create_window();
             drop_target::register(h);
+            if let Some(fp) = a.get(3) {
+                W.with(|c| {
+                    if let Some(w) = c.borrow_mut().as_mut() {
+                        w.paths = vec![PathBuf::from(fp)];
+                    }
+                });
+            }
             open_wheel(h, parse_mode(a.get(2)), true);
             message_loop();
         }
@@ -889,7 +1224,7 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Some("--live-Tour") | Some("--live-tour") => live_tour(),
+        Some("--live-Tour") | Some("--live-tour") => live_tour(a.get(2).map(PathBuf::from)),
         None if std::env::current_exe()
             .ok()
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()))

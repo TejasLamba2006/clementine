@@ -21,9 +21,15 @@
 </p>
 
 <p align="center">
-  <img src="web/images/live-convert.png" alt="Convert wheel (Shift)" width="32%" />
-  <img src="web/images/live-tools.png" alt="File tools wheel (Alt)" width="32%" />
-  <img src="web/images/live-actions.png" alt="File actions wheel (Ctrl)" width="32%" />
+  <img src="web/images/live-convert.png" alt="Convert wheel (Shift) over File Explorer" width="32%" />
+  <img src="web/images/live-tools.png" alt="File tools wheel (Alt) over File Explorer" width="32%" />
+  <img src="web/images/live-actions.png" alt="File actions wheel (Ctrl) over File Explorer" width="32%" />
+</p>
+
+<p align="center">
+  <img src="web/images/live-edit-photo.png" alt="Edit Photo interactive tool window over File Explorer" width="32%" />
+  <img src="web/images/live-add-bg.png" alt="Add BG interactive tool window over File Explorer" width="32%" />
+  <img src="web/images/progress-hud.png" alt="In-theme animated progress bar HUD over File Explorer" width="32%" />
 </p>
 
 | Modifier Key | Radial Wheel | What It Does |
