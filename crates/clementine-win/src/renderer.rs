@@ -14,27 +14,31 @@ pub struct Dib {
     pub bmp: HBITMAP,
     pub bits: *mut u32,
     old: HGDIOBJ,
+    len: usize,
 }
 
 impl Dib {
     pub fn new() -> Dib {
+        Dib::sized(SIZE, SIZE)
+    }
+    pub fn sized(w: usize, h: usize) -> Dib {
         unsafe {
             let dc = CreateCompatibleDC(null_mut());
             let mut bmi: BITMAPINFO = std::mem::zeroed();
             bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-            bmi.bmiHeader.biWidth = SIZE as i32;
-            bmi.bmiHeader.biHeight = -(SIZE as i32);
+            bmi.bmiHeader.biWidth = w as i32;
+            bmi.bmiHeader.biHeight = -(h as i32);
             bmi.bmiHeader.biPlanes = 1;
             bmi.bmiHeader.biBitCount = 32;
             bmi.bmiHeader.biCompression = BI_RGB;
             let mut bits: *mut std::ffi::c_void = null_mut();
             let bmp = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
             let old = SelectObject(dc, bmp);
-            Dib { dc, bmp, bits: bits as *mut u32, old }
+            Dib { dc, bmp, bits: bits as *mut u32, old, len: w * h }
         }
     }
     pub fn slice(&mut self) -> &mut [u32] {
-        unsafe { std::slice::from_raw_parts_mut(self.bits, N) }
+        unsafe { std::slice::from_raw_parts_mut(self.bits, self.len) }
     }
 }
 
@@ -195,46 +199,190 @@ fn gradient(t: f32) -> ([f32; 3], f32) {
     (rgb8(244, 246, 246), 0.75)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw_text(buf: &mut [Px], dib: &mut Dib, text: &str, cx: f64, cy: f64, col: [f32; 3], base_h: i32, maxw: i32) {
+const SS: i32 = 3;
+const BW: i32 = 80;
+const BH: i32 = 32;
+
+/// GDI text rendered at 3x into a small DIB, box-averaged 3x3 onto the wheel (even stem weight).
+fn draw_text(buf: &mut [Px], text: &str, cx: f64, cy: f64, col: [f32; 3], base_h: i32, maxw: i32) {
     unsafe {
+        let (bw3, bh3) = ((BW * SS) as usize, (BH * SS) as usize);
+        let dib = Dib::sized(bw3, bh3);
         let wide: Vec<u16> = text.encode_utf16().collect();
         let face: Vec<u16> = "Segoe UI Semibold\0".encode_utf16().collect();
         let mut h = base_h;
         let (font, old, sz) = loop {
             let font = CreateFontW(
-                -h, 0, 0, 0, 600, 0, 0, 0, DEFAULT_CHARSET as u32, OUT_DEFAULT_PRECIS as u32,
+                -h * SS, 0, 0, 0, 600, 0, 0, 0, DEFAULT_CHARSET as u32, OUT_DEFAULT_PRECIS as u32,
                 CLIP_DEFAULT_PRECIS as u32, ANTIALIASED_QUALITY as u32,
                 (DEFAULT_PITCH | FF_DONTCARE) as u32, face.as_ptr(),
             );
             let old = SelectObject(dib.dc, font);
             let mut sz: windows_sys::Win32::Foundation::SIZE = std::mem::zeroed();
             GetTextExtentPoint32W(dib.dc, wide.as_ptr(), wide.len() as i32, &mut sz);
-            if sz.cx <= maxw || h <= 8 {
+            if sz.cx <= maxw * SS || h <= 6 {
                 break (font, old, sz);
             }
             SelectObject(dib.dc, old);
             DeleteObject(font);
             h -= 1;
         };
-        std::ptr::write_bytes(dib.bits, 0, N);
+        std::ptr::write_bytes(dib.bits, 0, bw3 * bh3);
         SetBkMode(dib.dc, TRANSPARENT as i32);
         SetTextColor(dib.dc, 0x00FF_FFFF);
+        let (ox, oy) = ((cx - BW as f64 / 2.0).round(), (cy - BH as f64 / 2.0).round());
         TextOutW(
             dib.dc,
-            (cx - sz.cx as f64 / 2.0).round() as i32,
-            (cy - sz.cy as f64 / 2.0).round() as i32,
+            ((cx - ox) * SS as f64 - sz.cx as f64 / 2.0).round() as i32,
+            ((cy - oy) * SS as f64 - sz.cy as f64 / 2.0).round() as i32,
             wide.as_ptr(),
             wide.len() as i32,
         );
         GdiFlush();
         SelectObject(dib.dc, old);
         DeleteObject(font);
-        for (i, p) in dib.slice().iter().enumerate() {
-            // ClearType-free AA text on white: green channel is coverage
-            let a = ((p >> 8) & 255) as f32 / 255.0;
-            if a > 0.0 {
-                over(&mut buf[i], col, a);
+        let px = std::slice::from_raw_parts(dib.bits, bw3 * bh3);
+        let ss = SS as usize;
+        for by in 0..BH as usize {
+            for bx in 0..BW as usize {
+                let mut sum = 0u32;
+                for dy in 0..ss {
+                    for dx in 0..ss {
+                        sum += (px[(by * ss + dy) * bw3 + bx * ss + dx] >> 8) & 255;
+                    }
+                }
+                let a = sum as f32 / (255.0 * (ss * ss) as f32);
+                let (x, y) = (ox as i32 + bx as i32, oy as i32 + by as i32);
+                if a > 0.0 && x >= 0 && y >= 0 && x < SIZE as i32 && y < SIZE as i32 {
+                    over(&mut buf[y as usize * SIZE + x as usize], col, a);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+enum Sh {
+    Seg(f32, f32, f32, f32),
+    Ring(f32, f32, f32),
+    Disc(f32, f32, f32),
+}
+
+fn rect(x: f32, y: f32, w: f32, h: f32) -> Vec<Sh> {
+    vec![Sh::Seg(x, y, x + w, y), Sh::Seg(x + w, y, x + w, y + h), Sh::Seg(x + w, y + h, x, y + h), Sh::Seg(x, y + h, x, y)]
+}
+
+fn poly(p: &[(f32, f32)]) -> Vec<Sh> {
+    (0..p.len()).map(|i| Sh::Seg(p[i].0, p[i].1, p[(i + 1) % p.len()].0, p[(i + 1) % p.len()].1)).collect()
+}
+
+fn speaker() -> Vec<Sh> {
+    poly(&[(2.0, 7.0), (5.0, 7.0), (9.0, 4.0), (9.0, 14.0), (5.0, 11.0), (2.0, 11.0)])
+}
+
+fn doc() -> Vec<Sh> {
+    let mut v = poly(&[(4.0, 2.0), (11.0, 2.0), (14.0, 5.0), (14.0, 16.0), (4.0, 16.0)]);
+    v.extend([Sh::Seg(11.0, 2.0, 11.0, 5.0), Sh::Seg(11.0, 5.0, 14.0, 5.0)]);
+    v
+}
+
+/// 18x18 vector glyph for a tool/action id.
+fn icon_shapes(id: &str) -> Vec<Sh> {
+    use Sh::*;
+    match id {
+        "compress" => vec![
+            Seg(2.0, 2.0, 7.0, 7.0), Seg(7.0, 3.0, 7.0, 7.0), Seg(3.0, 7.0, 7.0, 7.0),
+            Seg(16.0, 16.0, 11.0, 11.0), Seg(11.0, 15.0, 11.0, 11.0), Seg(15.0, 11.0, 11.0, 11.0),
+        ],
+        "removeMetadata" => {
+            let mut v = poly(&[(3.0, 3.0), (9.0, 3.0), (15.0, 9.0), (9.0, 15.0), (3.0, 9.0)]);
+            v.push(Disc(6.0, 6.0, 1.2));
+            v
+        }
+        "editImage" => vec![Seg(2.0, 5.0, 16.0, 5.0), Seg(2.0, 13.0, 16.0, 13.0), Disc(6.0, 5.0, 2.0), Disc(12.0, 13.0, 2.0)],
+        "annotateImage" => poly(&[(3.0, 15.0), (4.0, 11.0), (12.0, 3.0), (15.0, 6.0), (7.0, 14.0)]),
+        "frameImage" => [rect(2.0, 2.0, 14.0, 14.0), rect(5.0, 5.0, 8.0, 8.0)].concat(),
+        "cropImage" | "cropVideo" => vec![Seg(5.0, 2.0, 5.0, 13.0), Seg(5.0, 13.0, 16.0, 13.0), Seg(2.0, 5.0, 13.0, 5.0), Seg(13.0, 5.0, 13.0, 16.0)],
+        "redactImage" | "redactVideo" => {
+            let mut v = poly(&[(2.0, 9.0), (6.0, 5.0), (12.0, 5.0), (16.0, 9.0), (12.0, 13.0), (6.0, 13.0)]);
+            v.extend([Disc(9.0, 9.0, 2.0), Seg(3.0, 16.0, 15.0, 2.0)]);
+            v
+        }
+        "createPDF" | "mergePDF" => doc(),
+        "copy" => [rect(2.0, 5.0, 9.0, 11.0), rect(7.0, 2.0, 9.0, 11.0)].concat(),
+        "copyPath" => {
+            let mut v = doc();
+            v.extend([Seg(6.0, 9.0, 12.0, 9.0), Seg(6.0, 12.0, 12.0, 12.0)]);
+            v
+        }
+        "createCollage" | "organizePDF" => [(2.0, 2.0), (10.0, 2.0), (2.0, 10.0), (10.0, 10.0)].iter().flat_map(|&(x, y)| rect(x, y, 6.0, 6.0)).collect(),
+        "normalizeAudio" | "audioToVideo" | "redactAudio" => {
+            [(3.0, 7.0, 11.0), (6.0, 4.0, 14.0), (9.0, 2.0, 16.0), (12.0, 5.0, 13.0), (15.0, 7.0, 11.0)]
+                .iter().map(|&(x, a, b)| Seg(x, a, x, b)).collect()
+        }
+        "muteVideo" => {
+            let mut v = speaker();
+            v.push(Seg(3.0, 16.0, 16.0, 2.0));
+            v
+        }
+        "trimVideo" | "trimAudio" => vec![Ring(5.0, 14.0, 2.2), Ring(13.0, 14.0, 2.2), Seg(6.5, 12.5, 14.0, 2.0), Seg(11.5, 12.5, 4.0, 2.0)],
+        "splitPDF" | "splitVideo" => [rect(2.0, 3.0, 14.0, 12.0), vec![Seg(9.0, 3.0, 9.0, 15.0)]].concat(),
+        "extractArchive" => {
+            let mut v = rect(2.0, 6.0, 14.0, 10.0);
+            v.extend([Seg(2.0, 6.0, 4.0, 2.0), Seg(4.0, 2.0, 14.0, 2.0), Seg(14.0, 2.0, 16.0, 6.0), Seg(7.0, 9.0, 11.0, 9.0)]);
+            v
+        }
+        "changeVideoSpeed" => vec![Ring(9.0, 10.0, 7.0), Seg(9.0, 10.0, 13.0, 6.0), Disc(9.0, 10.0, 1.3)],
+        "joinVideos" => [rect(2.0, 3.0, 14.0, 12.0), vec![Seg(6.0, 3.0, 6.0, 15.0), Seg(12.0, 3.0, 12.0, 15.0), Seg(2.0, 9.0, 6.0, 9.0), Seg(12.0, 9.0, 16.0, 9.0)]].concat(),
+        "videoSnapshots" => {
+            let mut v = rect(2.0, 5.0, 14.0, 10.0);
+            v.extend([Seg(6.0, 5.0, 7.0, 3.0), Seg(7.0, 3.0, 11.0, 3.0), Seg(11.0, 3.0, 12.0, 5.0), Ring(9.0, 10.0, 2.8)]);
+            v
+        }
+        "audioChannels" => {
+            let mut v = speaker();
+            v.extend([Seg(12.0, 6.0, 14.0, 9.0), Seg(14.0, 9.0, 12.0, 12.0), Seg(14.0, 4.0, 16.5, 9.0), Seg(16.5, 9.0, 14.0, 14.0)]);
+            v
+        }
+        "airDrop" => vec![Seg(9.0, 12.0, 9.0, 2.0), Seg(5.0, 6.0, 9.0, 2.0), Seg(13.0, 6.0, 9.0, 2.0), Seg(3.0, 9.0, 3.0, 16.0), Seg(3.0, 16.0, 15.0, 16.0), Seg(15.0, 16.0, 15.0, 9.0)],
+        "float" => vec![Ring(9.0, 6.0, 3.5), Seg(9.0, 9.5, 9.0, 16.0)],
+        "move" => poly(&[(2.0, 4.0), (7.0, 4.0), (9.0, 6.0), (16.0, 6.0), (16.0, 15.0), (2.0, 15.0)]),
+        "openTerminal" => vec![Seg(3.0, 5.0, 8.0, 9.0), Seg(8.0, 9.0, 3.0, 13.0), Seg(10.0, 14.0, 15.0, 14.0)],
+        _ => vec![Ring(9.0, 9.0, 6.0)],
+    }
+}
+
+fn seg_dist(px: f32, py: f32, a: f32, b: f32, c: f32, d: f32) -> f32 {
+    let (vx, vy) = (c - a, d - b);
+    let l = (vx * vx + vy * vy).max(1e-6);
+    let t = (((px - a) * vx + (py - b) * vy) / l).clamp(0.0, 1.0);
+    (px - a - t * vx).hypot(py - b - t * vy)
+}
+
+/// 4x4 supersampled vector icon, centered at `(cx, cy)`.
+fn draw_icon(buf: &mut [Px], id: &str, cx: f64, cy: f64, col: [f32; 3]) {
+    const G: usize = 18;
+    const Q: usize = 4;
+    const HALF: f32 = 0.8;
+    let shapes = icon_shapes(id);
+    let (ox, oy) = ((cx - 9.0).round() as i32, (cy - 9.0).round() as i32);
+    for y in 0..G {
+        for x in 0..G {
+            let mut n = 0;
+            for sy in 0..Q {
+                for sx in 0..Q {
+                    let (px, py) = (x as f32 + (sx as f32 + 0.5) / Q as f32, y as f32 + (sy as f32 + 0.5) / Q as f32);
+                    let hit = shapes.iter().any(|s| match *s {
+                        Sh::Seg(a, b, c, d) => seg_dist(px, py, a, b, c, d) <= HALF,
+                        Sh::Ring(a, b, r) => ((px - a).hypot(py - b) - r).abs() <= HALF,
+                        Sh::Disc(a, b, r) => (px - a).hypot(py - b) <= r,
+                    });
+                    n += hit as u32;
+                }
+            }
+            let (gx, gy) = (ox + x as i32, oy + y as i32);
+            if n > 0 && gx >= 0 && gy >= 0 && gx < SIZE as i32 && gy < SIZE as i32 {
+                over(&mut buf[gy as usize * SIZE + gx as usize], col, n as f32 / (Q * Q) as f32);
             }
         }
     }
@@ -246,7 +394,7 @@ fn rounded_box_sdf(x: f64, y: f64, hw: f64, hh: f64, r: f64) -> f64 {
 }
 
 /// Renders the full wheel. `labels.len()` is the petal count (max 9).
-pub fn render(base: &[Px], labels: &[String], selected: Option<usize>, center: &str) -> Vec<u32> {
+pub fn render(base: &[Px], labels: &[String], icons: Option<&[String]>, selected: Option<usize>, center: &str) -> Vec<u32> {
     let mut buf = base.to_vec();
     let n = labels.len().min(9);
     let polys: Vec<Vec<Point2D>> = (0..n).map(|i| build_petal_geometry(i, n).sample_polygon(32)).collect();
@@ -313,19 +461,24 @@ pub fn render(base: &[Px], labels: &[String], selected: Option<usize>, center: &
             if c > 0.0 {
                 let inner = (0.5 - (d + 1.0)).clamp(0.0, 1.0) as f32;
                 let i = y * SIZE + x;
-                over(&mut buf[i], [1.0; 3], 0.72 * c);
+                over(&mut buf[i], [1.0; 3], 0.86 * c);
                 over(&mut buf[i], [1.0; 3], 0.70 * (c - inner).max(0.0));
             }
         }
     }
 
-    let mut dib = Dib::new();
     for (i, l) in labels.iter().take(n).enumerate() {
         let p = label_position(i, n);
         let col = if selected == Some(i) { [1.0; 3] } else { [0.0; 3] };
-        draw_text(&mut buf, &mut dib, l, C + p.x, C + p.y, col, 13, 62);
+        match icons.and_then(|v| v.get(i)) {
+            Some(id) => {
+                draw_icon(&mut buf, id, C + p.x, C + p.y - 7.5, col);
+                draw_text(&mut buf, l, C + p.x, C + p.y + 10.5, col, 10, 62);
+            }
+            None => draw_text(&mut buf, l, C + p.x, C + p.y, col, 13, 62),
+        }
     }
-    draw_text(&mut buf, &mut dib, center, C, C, [0.0; 3], 13, 62);
+    draw_text(&mut buf, center, C, C, [0.0; 3], 13, 62);
 
     buf.iter()
         .map(|p| {

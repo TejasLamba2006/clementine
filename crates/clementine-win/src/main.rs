@@ -15,7 +15,9 @@ use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::Media::Audio::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
 use windows_sys::Win32::System::Ole::OleInitialize;
+use windows_sys::Win32::UI::Shell::{DragQueryFileW, Shell_NotifyIconW, HDROP, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW};
 use windows_sys::Win32::System::ProcessStatus::*;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
@@ -23,6 +25,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 static CLICK_WAV: &[u8] = include_bytes!("../assets/highlight.wav");
 const TIMER_ID: usize = 1;
+const TIMER_CLOSE_ID: usize = 2;
+const WM_APP_TRAY: u32 = WM_APP + 20;
 const BLOOM_MS: f64 = 200.0;
 const S: i32 = SIZE as i32;
 
@@ -87,7 +91,8 @@ fn rerender(w: &mut Wheel) {
         Some(i) => w.labels[i].clone(),
         None => w.center.clone(),
     };
-    w.frame = render(&w.base, &w.labels, w.selected, &center);
+    let icons = (w.mode != WheelMode::Conversions).then_some(w.ids.as_slice());
+    w.frame = render(&w.base, &w.labels, icons, w.selected, &center);
 }
 
 fn refresh_targets(w: &mut Wheel) {
@@ -134,6 +139,28 @@ fn present(hwnd: HWND, w: &Wheel) {
 }
 
 
+/// `CF_HDROP` paths currently on the clipboard (fallback when OLE has not delivered any).
+fn clipboard_paths(hwnd: HWND) -> Vec<PathBuf> {
+    let mut out = vec![];
+    unsafe {
+        if OpenClipboard(hwnd) == 0 {
+            return out;
+        }
+        let h = GetClipboardData(15) as HDROP;
+        if !h.is_null() {
+            let n = DragQueryFileW(h, u32::MAX, std::ptr::null_mut(), 0);
+            for i in 0..n {
+                let len = DragQueryFileW(h, i, std::ptr::null_mut(), 0) as usize;
+                let mut b = vec![0u16; len + 1];
+                DragQueryFileW(h, i, b.as_mut_ptr(), b.len() as u32);
+                out.push(PathBuf::from(String::from_utf16_lossy(&b[..len])));
+            }
+        }
+        CloseClipboard();
+    }
+    out
+}
+
 fn open_wheel(hwnd: HWND, mode: WheelMode, demo: bool) {
     let mut pt = POINT { x: 0, y: 0 };
     unsafe { GetCursorPos(&mut pt) };
@@ -143,6 +170,9 @@ fn open_wheel(hwnd: HWND, mode: WheelMode, demo: bool) {
         let was_open = w.open;
         w.mode = mode;
         if !was_open {
+            if w.paths.is_empty() {
+                w.paths = clipboard_paths(hwnd);
+            }
             w.cx = pt.x;
             w.cy = pt.y;
             w.base = make_base(capture_screen(pt.x, pt.y).as_deref());
@@ -164,6 +194,9 @@ fn open_wheel(hwnd: HWND, mode: WheelMode, demo: bool) {
                 present(hwnd, w);
                 ShowWindow(hwnd, SW_SHOWNA);
                 SetTimer(hwnd, TIMER_ID, 16, None);
+                // Nudge so an in-flight DoDragDrop fires DragEnter without waiting for real movement.
+                SetCursorPos(pt.x + 1, pt.y);
+                SetCursorPos(pt.x, pt.y);
             } else {
                 present(hwnd, w);
             }
@@ -179,6 +212,7 @@ fn close_wheel(hwnd: HWND) {
     });
     unsafe {
         KillTimer(hwnd, TIMER_ID);
+        KillTimer(hwnd, TIMER_CLOSE_ID);
         ShowWindow(hwnd, SW_HIDE);
         SetWindowRgn(hwnd, std::ptr::null_mut(), 0);
     }
@@ -272,8 +306,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM) -
         WM_APP_DRAG_END => {
             let on = W.with(|c| c.borrow().as_ref().is_some_and(|w| w.open && w.demo_until.is_none()));
             if on {
-                // Outside-wheel release closes it; an in-wheel drop arrives via IDropTarget first.
-                close_wheel(hwnd);
+                // Let IDropTarget::Drop (WM_APP_DROP) win the race; otherwise decide on the timer.
+                SetTimer(hwnd, TIMER_CLOSE_ID, 50, None);
             }
             0
         }
@@ -294,6 +328,43 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM) -
             if W.with(|c| c.borrow().as_ref().is_some_and(|w| w.demo_until.is_some())) {
                 commit(hwnd);
                 PostQuitMessage(0);
+            }
+            0
+        }
+        WM_TIMER if wp == TIMER_CLOSE_ID => {
+            KillTimer(hwnd, TIMER_CLOSE_ID);
+            let commit_it = W.with(|c| c.borrow().as_ref().is_some_and(|w| w.open && w.selected.is_some() && !w.paths.is_empty()));
+            if commit_it {
+                commit(hwnd);
+            } else {
+                close_wheel(hwnd);
+            }
+            0
+        }
+        WM_APP_TRAY => {
+            if matches!(lp as u32, WM_RBUTTONUP | WM_CONTEXTMENU) {
+                let menu = CreatePopupMenu();
+                for (id, s) in [(1, "Open Demo Wheel"), (2, "Show Floating Shelf"), (3, "Quit Clementine")] {
+                    AppendMenuW(menu, MF_STRING, id, w16(s).as_ptr());
+                }
+                let mut pt = POINT { x: 0, y: 0 };
+                GetCursorPos(&mut pt);
+                SetForegroundWindow(hwnd);
+                TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, std::ptr::null());
+                PostMessageW(hwnd, WM_NULL, 0, 0);
+                DestroyMenu(menu);
+            }
+            0
+        }
+        WM_COMMAND => {
+            match wp & 0xFFFF {
+                1 => {
+                    open_wheel(hwnd, WheelMode::Conversions, false);
+                    SetTimer(hwnd, TIMER_CLOSE_ID, 3000, None);
+                }
+                2 => shelf::add(hwnd, &[]),
+                3 => PostQuitMessage(0),
+                _ => {}
             }
             0
         }
@@ -368,6 +439,48 @@ fn create_window() -> HWND {
     }
 }
 
+fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
+    unsafe {
+        let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = hwnd;
+        nid.uID = 1;
+        nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        nid.uCallbackMessage = WM_APP_TRAY;
+        for (d, c) in nid.szTip.iter_mut().zip("Clementine".encode_utf16()) {
+            *d = c;
+        }
+        nid
+    }
+}
+
+/// 16x16 orange radial icon, generated in code.
+fn tray_icon() -> HICON {
+    let mut xor = Vec::with_capacity(16 * 16 * 4);
+    for y in 0..16 {
+        for x in 0..16 {
+            let r = ((x as f32 + 0.5 - 8.0).hypot(y as f32 + 0.5 - 8.0) - 7.0).clamp(-0.5, 0.5);
+            let a = (0.5 - r) as f32;
+            let hole = (x as f32 + 0.5 - 8.0).hypot(y as f32 + 0.5 - 8.0) < 2.5;
+            let a = if hole { 0.0 } else { a };
+            xor.extend([0u8, (82.0 * a) as u8, (255.0 * a) as u8, (255.0 * a) as u8]);
+        }
+    }
+    let and = [0u8; 32];
+    unsafe { CreateIcon(std::ptr::null_mut(), 16, 16, 1, 32, and.as_ptr(), xor.as_ptr()) }
+}
+
+fn add_tray(hwnd: HWND) {
+    let mut nid = tray_data(hwnd);
+    nid.hIcon = tray_icon();
+    unsafe { Shell_NotifyIconW(NIM_ADD, &nid) };
+}
+
+fn remove_tray(hwnd: HWND) {
+    let nid = tray_data(hwnd);
+    unsafe { Shell_NotifyIconW(NIM_DELETE, &nid) };
+}
+
 fn message_loop() {
     unsafe {
         let mut msg: MSG = std::mem::zeroed();
@@ -396,13 +509,14 @@ fn working_set_mb() -> f64 {
 }
 
 fn render_state(mode: WheelMode, ext: &str, sel: Option<usize>, center: &str) -> Vec<u32> {
-    let (_, labels) = targets(mode, ext, 1);
+    let (ids, labels) = targets(mode, ext, 1);
     let base = make_base(Some(&synthetic_backdrop()));
     let c = match sel {
         Some(i) if i < labels.len() => labels[i].as_str(),
         _ => center,
     };
-    render(&base, &labels, sel, c)
+    let icons = (mode != WheelMode::Conversions).then_some(ids.as_slice());
+    render(&base, &labels, icons, sel, c)
 }
 
 fn self_test() -> std::result::Result<(), String> {
@@ -464,7 +578,9 @@ fn main() {
             let h = create_window();
             drop_target::register(h);
             hook::install(h as usize);
+            add_tray(h);
             message_loop();
+            remove_tray(h);
         }
     }
 }
