@@ -8,6 +8,7 @@ const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Clementine";
 const APP: &str = "Clementine";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const DETACHED_PROCESS: u32 = 0x0000_0008;
 
 fn w(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
@@ -112,7 +113,11 @@ pub fn install_app(quiet: bool) -> Result<PathBuf, String> {
     std::fs::create_dir_all(install_dir()).map_err(|e| e.to_string())?;
     let cur = std::env::current_exe().map_err(|e| e.to_string())?;
     if cur != target {
-        // ponytail: a locked (running) installed exe is kept as-is instead of killing it
+        let _ = std::process::Command::new("taskkill.exe")
+            .args(["/F", "/IM", "Clementine.exe"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+        std::thread::sleep(std::time::Duration::from_millis(120));
         if let Err(e) = std::fs::copy(&cur, &target) {
             if !target.exists() {
                 return Err(format!("copy failed: {e}"));
@@ -134,8 +139,12 @@ pub fn install_app(quiet: bool) -> Result<PathBuf, String> {
     unsafe { RegCloseKey(k) };
     r?;
     make_shortcut(&target)?;
+    let _ = std::process::Command::new(&target)
+        .arg("--startup")
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+        .spawn();
     if !quiet {
-        message("Clementine has been installed!\n\n\u{2022} Added to Start Menu & Installed Apps\n\u{2022} Configured to run automatically at Windows startup\n\u{2022} Running in your System Tray\n\nDrag any file and tap Shift (Convert), Alt (Tools), or Ctrl (Actions).");
+        message("Clementine has been installed!\n\n\u{2022} Added to Start Menu & Installed Apps\n\u{2022} Configured to run automatically at Windows startup\n\u{2022} Running silently in your System Tray (no terminal window)\n\nDrag any file and tap Shift (Convert), Alt (Tools), or Ctrl (Actions).");
     }
     Ok(target)
 }

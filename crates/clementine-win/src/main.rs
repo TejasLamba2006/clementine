@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), windows_subsystem = "windows")]
+
 mod actions;
 mod drop_target;
 mod hook;
@@ -893,11 +895,8 @@ fn main() {
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()))
             .is_some_and(|n| n.contains("setup") || n.contains("install")) =>
         {
-            match install::install_app(false) {
-                Ok(exe) => {
-                    let _ = std::process::Command::new(exe).arg("--startup").spawn();
-                }
-                Err(e) => eprintln!("install failed: {e}"),
+            if let Err(e) = install::install_app(false) {
+                eprintln!("install failed: {e}");
             }
         }
         _ => {

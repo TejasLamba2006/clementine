@@ -323,11 +323,16 @@ fn scene(f: usize, acts: &[Act], bg: &[Px], base: &[Px], cx: &mut Ctx) -> (Vec<P
         composite(&mut b, &fr, 1.0, 1.0, WC.0, WC.1);
     }
 
-    // keycap
+    let za = sm(seg(u, 0.2, 0.4)) * (1.0 - sm(seg(u, 0.78, 0.98)));
+    let z = 1.0 + (act.zmax - 1.0) * za;
+    let focus_x = lerp(480.0, WC.0, za);
+    let focus_y = lerp(320.0, WC.1, za);
+
+    // keycap anchored near bottom of current camera viewport so it stays visible during zoom
     let press = if (0.12..0.95).contains(&u) { sm(seg(u, 0.12, 0.18)) } else { 0.0 };
     let ka = sm(seg(u, 0.08, 0.12)) * (1.0 - sm(seg(u, 0.95, 1.0)));
     if ka > 0.0 {
-        let (kx, ky) = (480.0, 590.0);
+        let (kx, ky) = (focus_x, focus_y + (320.0 - 44.0) / z);
         let accent = c8(213, 82, 35);
         if press > 0.0 {
             shadow(&mut b, kx, ky, 58.0, 28.0, 12.0, 0.0, 14.0, 0.0);
@@ -354,9 +359,7 @@ fn scene(f: usize, acts: &[Act], bg: &[Px], base: &[Px], cx: &mut Ctx) -> (Vec<P
         }
     }
 
-    let za = sm(seg(u, 0.2, 0.4)) * (1.0 - sm(seg(u, 0.78, 0.98)));
-    let z = 1.0 + (act.zmax - 1.0) * za;
-    (b, z, (lerp(480.0, WC.0, za), lerp(320.0, WC.1, za)), cur)
+    (b, z, (focus_x, focus_y), cur)
 }
 
 pub fn render_showcase_frames(out_dir: &Path) -> std::result::Result<(), String> {
