@@ -1,6 +1,7 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod actions;
+mod dashboard;
 mod drop_target;
 mod hook;
 mod install;
@@ -249,6 +250,16 @@ fn present_hwnd(hwnd: HWND) {
             }
         }
     }
+    // Keep alpha >= 1 inside the wheel disc so Windows OLE DoDragDrop & WindowFromPoint hit the center hole
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let dx = x as i32 - 136;
+            let dy = y as i32 - 136;
+            if dx * dx + dy * dy <= 126 * 126 && (out[y * SIZE + x] >> 24) == 0 {
+                out[y * SIZE + x] = 0x0100_0000;
+            }
+        }
+    }
     unsafe {
         let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: (alpha * 255.0) as u8, AlphaFormat: AC_SRC_ALPHA as u8 };
         let pt = POINT { x: cx - 136, y: cy - 136 };
@@ -284,7 +295,14 @@ fn clipboard_paths(hwnd: HWND) -> Vec<PathBuf> {
 fn open_wheel(hwnd: HWND, mode: WheelMode, demo: bool) {
     let mut pt = POINT { x: 0, y: 0 };
     unsafe { GetCursorPos(&mut pt) };
-    let clip = clipboard_paths(hwnd);
+    let mut initial_paths = PATHS.lock().unwrap().clone();
+    if initial_paths.is_empty() && !demo && TOUR_DIR.with(|d| d.borrow().is_none()) {
+        initial_paths = drop_target::query_active_explorer_selection();
+    }
+    if initial_paths.is_empty() {
+        initial_paths = clipboard_paths(hwnd);
+    }
+    hook::set_wheel_open(true);
     let (was_open, cx, cy) = W.with(|c| {
         let mut g = c.borrow_mut();
         let w = g.as_mut().unwrap();
@@ -292,7 +310,7 @@ fn open_wheel(hwnd: HWND, mode: WheelMode, demo: bool) {
         w.mode = mode;
         if !was_open {
             if w.paths.is_empty() {
-                w.paths = clip;
+                w.paths = initial_paths;
             }
             w.cx = pt.x;
             w.cy = pt.y;
@@ -324,6 +342,8 @@ fn open_wheel(hwnd: HWND, mode: WheelMode, demo: bool) {
 }
 
 fn close_wheel(hwnd: HWND) {
+    hook::set_wheel_open(false);
+    PATHS.lock().unwrap().clear();
     W.with(|c| {
         if let Some(w) = c.borrow_mut().as_mut() {
             w.open = false;
@@ -355,7 +375,7 @@ fn select_at(hwnd: HWND, sx: i32, sy: i32) {
     });
     if let Some(play) = changed {
         present_hwnd(hwnd);
-        if play {
+        if play && dashboard::is_sound_enabled() {
             unsafe { PlaySoundW(CLICK_WAV.as_ptr() as _, std::ptr::null_mut(), SND_MEMORY | SND_ASYNC | SND_NODEFAULT) };
         }
     }
@@ -429,6 +449,8 @@ fn commit(hwnd: HWND) {
         return quit();
     };
     let name = last.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let sz = std::fs::metadata(last).map(|m| human_size(m.len())).unwrap_or_else(|_| "done".into());
+    dashboard::record_activity(name.clone(), sz, last.clone());
     let (title, saved) = match (mode, id.as_str()) {
         (WheelMode::Tools, "removeMetadata") => ("STRIPPING METADATA".to_string(), "Removed EXIF & GPS tags".to_string()),
         (WheelMode::Tools, "compress") => ("COMPRESSING FILE".to_string(), format!("Saved {name}")),
@@ -523,21 +545,25 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM) -
             select_at(hwnd, x, y);
             0
         }
-        WM_APP_OVER => {
+        WM_APP_OVER | WM_APP_HOOK_MOVE => {
             select_at(hwnd, x, y);
             0
         }
         WM_APP_DROP => {
             select_at(hwnd, x, y);
-            W.with(|c| {
-                if let Some(w) = c.borrow_mut().as_mut() {
-                    w.paths = PATHS.lock().unwrap().clone();
-                }
-            });
+            let p = PATHS.lock().unwrap().clone();
+            if !p.is_empty() {
+                W.with(|c| {
+                    if let Some(w) = c.borrow_mut().as_mut() {
+                        w.paths = p;
+                    }
+                });
+            }
             commit(hwnd);
             0
         }
         WM_APP_DRAG_END => {
+            select_at(hwnd, x, y);
             let on = W.with(|c| c.borrow().as_ref().is_some_and(|w| w.open && w.demo_until.is_none()));
             if on {
                 // Let IDropTarget::Drop (WM_APP_DROP) win the race; otherwise decide on the timer.
@@ -559,9 +585,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM) -
             0
         }
         WM_LBUTTONDOWN => {
-            if W.with(|c| c.borrow().as_ref().is_some_and(|w| w.demo_until.is_some())) {
+            let (is_open, is_cli_demo) = W.with(|c| {
+                let g = c.borrow();
+                let Some(w) = g.as_ref() else { return (false, false) };
+                (w.open, w.demo_until.is_some())
+            });
+            if is_open {
                 commit(hwnd);
-                PostQuitMessage(0);
+                if is_cli_demo {
+                    PostQuitMessage(0);
+                }
             }
             0
         }
@@ -597,10 +630,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM) -
             0
         }
         WM_APP_TRAY => {
-            if matches!(lp as u32, WM_RBUTTONUP | WM_CONTEXTMENU) {
+            if matches!(lp as u32, WM_LBUTTONUP | WM_LBUTTONDBLCLK) {
+                dashboard::show(hwnd);
+            } else if matches!(lp as u32, WM_RBUTTONUP | WM_CONTEXTMENU) {
                 let menu = CreatePopupMenu();
                 let on = if install::is_startup_enabled() { MF_CHECKED } else { MF_UNCHECKED };
                 for (id, s, f) in [
+                    (6, "Open Clementine Dashboard", MF_STRING),
                     (1, "Open Demo Wheel", MF_STRING),
                     (2, "Show Floating Shelf", MF_STRING),
                     (3, "Run at Windows Startup", MF_STRING | on),
@@ -620,9 +656,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM) -
         }
         WM_COMMAND => {
             match wp & 0xFFFF {
+                6 => dashboard::show(hwnd),
                 1 => {
+                    let (cx, cy) = (GetSystemMetrics(SM_CXSCREEN) / 2, GetSystemMetrics(SM_CYSCREEN) / 2);
+                    SetCursorPos(cx, cy);
                     open_wheel(hwnd, WheelMode::Conversions, false);
-                    SetTimer(hwnd, TIMER_DEMO_ID, 3000, None);
+                    SetTimer(hwnd, TIMER_DEMO_ID, 6000, None);
                 }
                 2 => shelf::add(hwnd, &[]),
                 3 => {
@@ -1126,6 +1165,8 @@ fn self_test() -> std::result::Result<(), String> {
     tool_window::to_modal_image(&tc).save("target/test-tool-edit.png").map_err(|e| e.to_string())?;
     let tf = tool_window::render_tool_card("frameImage", &[]);
     tool_window::to_modal_image(&tf).save("target/test-tool-frame.png").map_err(|e| e.to_string())?;
+    let db = dashboard::render_dashboard();
+    dashboard::to_dashboard_image(&db).save("target/test-dashboard.png").map_err(|e| e.to_string())?;
     println!("self-test ok: target/self-test-wheel.png");
     Ok(())
 }
@@ -1239,6 +1280,9 @@ fn main() {
             drop_target::register(h);
             hook::install(h as usize);
             add_tray(h);
+            if a.get(1).map(|s| s.as_str()) != Some("--startup") {
+                dashboard::show(h);
+            }
             message_loop();
             remove_tray(h);
         }

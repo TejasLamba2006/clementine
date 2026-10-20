@@ -21,6 +21,10 @@
 </p>
 
 <p align="center">
+  <img src="web/images/dashboard.png" alt="Clementine Dashboard (Home, Playground, Recent Activity & Settings)" width="76%" />
+</p>
+
+<p align="center">
   <img src="web/images/live-convert.png" alt="Convert wheel (Shift) over File Explorer" width="32%" />
   <img src="web/images/live-tools.png" alt="File tools wheel (Alt) over File Explorer" width="32%" />
   <img src="web/images/live-actions.png" alt="File actions wheel (Ctrl) over File Explorer" width="32%" />
