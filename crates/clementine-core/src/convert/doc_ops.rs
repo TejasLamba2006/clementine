@@ -775,6 +775,89 @@ pub fn pdf_to_text(bytes: &[u8]) -> Result<String> {
     Ok(out.trim().to_string() + "\n")
 }
 
+/// 100% offline OCR via Windows' built-in `Windows.Media.Ocr.OcrEngine` (for images and scanned PDFs),
+/// plus direct text-stream extraction for PDFs.
+pub fn extract_text_ocr_from_file(path: &Path) -> Result<String> {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if ext == "pdf" {
+        if let Ok(raw) = fs::read(path) {
+            if let Ok(txt) = pdf_to_text(&raw) {
+                if !txt.trim().is_empty() {
+                    return Ok(txt);
+                }
+            }
+            if let Ok(pages) = pdf_pages(&raw) {
+                let mut combined = Vec::new();
+                for (idx, p) in pages.iter().enumerate() {
+                    if let Some((jpeg_bytes, _, _)) = &p.jpeg {
+                        let tmp = std::env::temp_dir().join(format!("clementine_ocr_page_{idx}.jpg"));
+                        if fs::write(&tmp, jpeg_bytes).is_ok() {
+                            if let Ok(page_txt) = run_windows_media_ocr(&tmp) {
+                                if !page_txt.trim().is_empty() {
+                                    combined.push(page_txt.trim().to_string());
+                                }
+                            }
+                            let _ = fs::remove_file(&tmp);
+                        }
+                    }
+                }
+                if !combined.is_empty() {
+                    return Ok(combined.join("\n\n") + "\n");
+                }
+            }
+        }
+    }
+    run_windows_media_ocr(path)
+}
+
+fn run_windows_media_ocr(image_path: &Path) -> Result<String> {
+    let abs = fs::canonicalize(image_path).unwrap_or_else(|_| image_path.to_path_buf());
+    let clean_path = abs
+        .display()
+        .to_string()
+        .trim_start_matches(r"\\?\")
+        .replace('\'', "''");
+    let script = format!(
+        r#"Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {{ $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -like 'IAsyncOperation*' }})[0]
+function Await($WinRtTask, $ResultType) {{
+    $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
+    $netTask = $asTask.Invoke($null, @($WinRtTask))
+    $netTask.Wait(-1) | Out-Null
+    $netTask.Result
+}}
+[Windows.Storage.StorageFile,Windows.Storage,ContentType=WindowsRuntime] | Out-Null
+[Windows.Graphics.Imaging.BitmapDecoder,Windows.Graphics,ContentType=WindowsRuntime] | Out-Null
+[Windows.Media.Ocr.OcrEngine,Windows.Foundation.UniversalApiContract,ContentType=WindowsRuntime] | Out-Null
+$file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync('{clean_path}')) ([Windows.Storage.StorageFile])
+$stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+$decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+$bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+$engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+$result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+foreach ($line in $result.Lines) {{ Write-Output $line.Text }}"#
+    );
+    let mut cmd = std::process::Command::new("powershell.exe");
+    cmd.args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| ClementineError::InvalidInput(format!("OCR failed to start: {e}")))?;
+    let text = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n").trim().to_string();
+    if text.is_empty() {
+        Ok("(No text detected in image)\n".to_string())
+    } else {
+        Ok(text + "\n")
+    }
+}
+
 /// Writes every page of `src` as `Page N.pdf` inside `out_dir`.
 pub fn split_pdf(src: &Path, out_dir: &Path) -> Result<()> {
     fs::create_dir_all(out_dir)?;

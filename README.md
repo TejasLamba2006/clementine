@@ -4,7 +4,7 @@
   <img src="web/images/og-banner.png" alt="Clementine for Windows - The zero-click offline file converter" width="100%" />
 </p>
 
-**Clementine** is a zero-click, offline file converter, 27-tool file suite (including 100% local **Remove BG**), and 6-action radial wheel for Windows 10 & 11. Drag any file in File Explorer, tap a modifier key (`Shift`, `Alt`, or `Ctrl`), and drop it onto a glass petal. Everything runs 100% locally in a single `3.3 MB` native Rust + Win32 executable using `~7.5 MB` of RAM with built-in GitHub Releases auto-updating, zero background servers, and zero telemetry.
+**Clementine** is a zero-click, offline file converter, 29-tool file suite (including 100% local **Neural AI Remove BG**, **Offline OCR Text Extraction**, and **2x/4x Super-Res Upscale & Sharpen**), and 6-action radial wheel for Windows 10 & 11. Drag any file in File Explorer, tap a modifier key (`Shift`, `Alt`, or `Ctrl`), and drop it onto a glass petal. Everything runs 100% locally in a single native Rust + Win32 executable using `~7.5 MB` of RAM with built-in GitHub Releases auto-updating, zero background servers, and zero telemetry.
 
 <p align="center">
   <a href="https://tejaslamba2006.github.io/clementine/"><strong>Live Interactive Website & Playground</strong></a> ·
@@ -39,7 +39,7 @@
 | Modifier Key | Radial Wheel | What It Does |
 | :--- | :--- | :--- |
 | **`Shift`** | **Convert (`275` paths)** | Convert between image, audio, video, PDF, document, presentation, spreadsheet, subtitle, and archive formats |
-| **`Alt`** | **File Tools (`27` tools)** | Remove BG (100% local), compress, strip metadata, edit/annotate/frame/crop/redact photos, collage, trim/crop/speed/join/split/mute video, normalize/trim/bleep audio, merge/split/organize PDFs, extract archives |
+| **`Alt`** | **File Tools (`29` tools)** | Neural AI Remove BG (`u2netp.onnx`), Offline OCR (`Windows.Media.Ocr`), 2x/4x Upscale & Sharpen, compress, strip metadata, edit/annotate/frame/crop/redact photos, collage, trim/crop/speed/join/split/mute video, normalize/trim/bleep audio, merge/split/organize PDFs, extract archives |
 | **`Ctrl`** | **File Actions (`6` actions)** | Nearby Share, Float (pinned screen-edge shelf), Copy (`CF_HDROP`), Move, Copy Path, Open in Windows Terminal / PowerShell |
 
 ---

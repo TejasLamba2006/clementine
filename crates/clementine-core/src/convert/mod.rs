@@ -256,8 +256,13 @@ fn dispatch(
 ) -> Result<()> {
     let unsupported = || ClementineError::UnsupportedTool(tool_id.to_string());
     match tool_id {
-        "removeBg" | "editImage" | "annotateImage" | "cropImage" | "frameImage" | "redactImage"
-        | "createPDF" | "createCollage" => image_ops::tool(job, tool_id, params, out),
+        "removeBg" | "upscaleImage" | "editImage" | "annotateImage" | "cropImage" | "frameImage"
+        | "redactImage" | "createPDF" | "createCollage" => image_ops::tool(job, tool_id, params, out),
+        "extractText" => {
+            let txt = doc_ops::extract_text_ocr_from_file(&job[0])?;
+            fs::write(out, txt.as_bytes())?;
+            Ok(())
+        }
         "compress" | "removeMetadata" => {
             if image_ops::is_image_ext(ext) {
                 image_ops::tool(job, tool_id, params, out)

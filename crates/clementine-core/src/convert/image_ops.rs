@@ -353,9 +353,121 @@ pub fn apply_photo_edits(img: &RgbaImage, p: &ToolParams) -> RgbaImage {
     out
 }
 
-/// 100% local border-floodfill + perceptual chroma/luma edge-matting background removal.
-/// Uses `p.quality` (10..=90, default 42) as color tolerance and `p.padding` (0..=40, default 18) as soft edge feathering.
+/// Returns the local path to the cached `u2netp.onnx` (4.5 MB Silueta / U2Netp portrait & object segmentation model).
+pub fn onnx_bg_model_path() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("Clementine").join("models").join("u2netp.onnx")
+}
+
+/// Downloads `u2netp.onnx` (4.5 MB) to `%LOCALAPPDATA%\Clementine\models\u2netp.onnx` if not already cached.
+pub fn ensure_onnx_bg_model() -> Result<PathBuf> {
+    let dest = onnx_bg_model_path();
+    if dest.is_file() && dest.metadata().map(|m| m.len() > 100_000).unwrap_or(false) {
+        return Ok(dest);
+    }
+    if let Some(parent) = dest.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let url = "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx";
+    let ps = format!(
+        "$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri '{}' -OutFile '{}' -TimeoutSec 45",
+        url,
+        dest.display().to_string().replace('\'', "''")
+    );
+    let mut cmd = std::process::Command::new("powershell.exe");
+    cmd.args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &ps]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let st = cmd.status().map_err(ie)?;
+    if st.success() && dest.is_file() {
+        Ok(dest)
+    } else {
+        Err(ie("failed to download local u2netp.onnx model"))
+    }
+}
+
+/// Runs pure-Rust `tract-onnx` inference on `u2netp.onnx` (320x320 RGB normalized tensor -> 320x320 saliency probability map).
+fn remove_background_onnx(img: &RgbaImage, model_path: &Path, p: &ToolParams) -> Option<RgbaImage> {
+    use tract_onnx::prelude::*;
+    let model = tract_onnx::onnx()
+        .model_for_path(model_path)
+        .ok()?
+        .with_input_fact(0, f32::fact([1, 3, 320, 320]).into())
+        .ok()?
+        .into_optimized()
+        .ok()?
+        .into_runnable()
+        .ok()?;
+
+    let resized = imageops::resize(img, 320, 320, Resize::Triangle);
+    let mean = [0.485f32, 0.456, 0.406];
+    let std = [0.229f32, 0.224, 0.225];
+    let mut input = tract_ndarray::Array4::<f32>::zeros((1, 3, 320, 320));
+    for y in 0..320usize {
+        for x in 0..320usize {
+            let px = resized.get_pixel(x as u32, y as u32).0;
+            for c in 0..3 {
+                let v = (px[c] as f32 / 255.0 - mean[c]) / std[c];
+                input[[0, c, y, x]] = v;
+            }
+        }
+    }
+    let outputs = model.run(tvec!(input.into_tensor().into())).ok()?;
+    let mask_view = outputs[0].to_array_view::<f32>().ok()?;
+    let slice = mask_view.as_slice()?;
+    if slice.len() < 320 * 320 {
+        return None;
+    }
+    let mut min_v = f32::MAX;
+    let mut max_v = f32::MIN;
+    for &v in &slice[..320 * 320] {
+        if v < min_v {
+            min_v = v;
+        }
+        if v > max_v {
+            max_v = v;
+        }
+    }
+    let span = (max_v - min_v).max(1e-5);
+    let cutoff = ((100 - p.quality.clamp(10, 90)) as f32 / 100.0).clamp(0.15, 0.85);
+    let feather = (p.padding.clamp(1, 50) as f32 / 100.0).clamp(0.02, 0.45);
+    let mut mask_img = image::GrayImage::new(320, 320);
+    for y in 0..320u32 {
+        for x in 0..320u32 {
+            let prob = (slice[(y * 320 + x) as usize] - min_v) / span;
+            let a = ((prob - (cutoff - feather * 0.5)) / feather).clamp(0.0, 1.0);
+            mask_img.put_pixel(x, y, image::Luma([(a * 255.0).round() as u8]));
+        }
+    }
+    let full_mask = imageops::resize(&mask_img, img.width(), img.height(), Resize::Lanczos3);
+    let mut out = img.clone();
+    for (x, y, px) in out.enumerate_pixels_mut() {
+        let m = full_mask.get_pixel(x, y).0[0] as u32;
+        px.0[3] = ((px.0[3] as u32 * m) / 255) as u8;
+    }
+    Some(out)
+}
+
+/// 100% local background removal: uses neural `u2netp.onnx` via `tract-onnx` when cached (or when `p.redact_solid` requests AI mode),
+/// falling back to border-floodfill + perceptual chroma/luma edge matting.
 pub fn remove_background_local(img: &RgbaImage, p: &ToolParams) -> RgbaImage {
+    let model_path = onnx_bg_model_path();
+    if model_path.is_file() {
+        if let Some(neural) = remove_background_onnx(img, &model_path, p) {
+            return neural;
+        }
+    } else if p.redact_solid {
+        if let Ok(downloaded) = ensure_onnx_bg_model() {
+            if let Some(neural) = remove_background_onnx(img, &downloaded, p) {
+                return neural;
+            }
+        }
+    }
     let (w, h) = img.dimensions();
     if w < 2 || h < 2 {
         return img.clone();
@@ -484,6 +596,69 @@ pub fn remove_background_local(img: &RgbaImage, p: &ToolParams) -> RgbaImage {
         }
     }
     out
+}
+
+/// 100% local Lanczos3 super-resolution (`2x` / `4x`) + Unsharp Mask + luminance CAS (Contrast Adaptive Sharpening).
+/// `p.collage_cols` = scale factor (`2` or `4`, or `1` for sharpen-only), `p.quality` = sharpness (`0..=100`), `p.padding` = denoise (`0..=40`).
+pub fn apply_upscale_sharpen(img: &RgbaImage, p: &ToolParams) -> RgbaImage {
+    let scale = p.collage_cols.clamp(1, 4);
+    let (w, h) = img.dimensions();
+    // Cap max output dimension at 7680px (8K) so memory stays bounded
+    let target_w = (w * scale).min(7680).max(1);
+    let target_h = (h * scale).min(7680).max(1);
+    let mut base = if scale > 1 {
+        imageops::resize(img, target_w, target_h, Resize::Lanczos3)
+    } else {
+        img.clone()
+    };
+
+    // Optional light 3x3 bilateral-style luma denoise pass before sharpening
+    if p.padding > 4 {
+        let strength = (p.padding.min(40) as f32) / 100.0;
+        let copy = base.clone();
+        let (bw, bh) = base.dimensions();
+        for y in 1..bh.saturating_sub(1) {
+            for x in 1..bw.saturating_sub(1) {
+                let c = copy.get_pixel(x, y).0;
+                let mut sum = [0f32; 3];
+                let mut wsum = 0f32;
+                for (dx, dy) in [(-1i32, 0), (1, 0), (0, -1), (0, 1), (0, 0)] {
+                    let np = copy.get_pixel((x as i32 + dx) as u32, (y as i32 + dy) as u32).0;
+                    let diff = (c[0] as f32 - np[0] as f32).abs()
+                        + (c[1] as f32 - np[1] as f32).abs()
+                        + (c[2] as f32 - np[2] as f32).abs();
+                    let wt = (-diff / 42.0).exp();
+                    for k in 0..3 {
+                        sum[k] += np[k] as f32 * wt;
+                    }
+                    wsum += wt;
+                }
+                let out_px = base.get_pixel_mut(x, y);
+                for k in 0..3 {
+                    let avg = sum[k] / wsum.max(1e-4);
+                    out_px.0[k] = (c[k] as f32 * (1.0 - strength) + avg * strength).clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+    }
+
+    // Contrast-Adaptive Unsharp Mask (CAS)
+    let sharp = (p.quality as f32 / 100.0).clamp(0.0, 1.5);
+    if sharp > 0.02 {
+        let blurred = imageops::blur(&base, 1.15);
+        let amount = sharp * 1.35;
+        for (x, y, px) in base.enumerate_pixels_mut() {
+            let b = blurred.get_pixel(x, y).0;
+            for k in 0..3 {
+                let orig = px.0[k] as f32;
+                let detail = orig - b[k] as f32;
+                // Attenuate extreme haloing near 0 or 255
+                let headroom = 1.0 - ((orig - 127.5).abs() / 135.0).powi(2).clamp(0.0, 0.75);
+                px.0[k] = (orig + detail * amount * headroom).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    base
 }
 
 /// Background canvas with padding, rounded card and blurred drop shadow.
@@ -672,6 +847,7 @@ pub fn tool(job: &[PathBuf], tool_id: &str, p: &ToolParams, out: &Path) -> Resul
                 "compress" => shrink(img, &ext, p),
                 "removeMetadata" => img,
                 "removeBg" => DynamicImage::ImageRgba8(remove_background_local(&img.to_rgba8(), p)),
+                "upscaleImage" => DynamicImage::ImageRgba8(apply_upscale_sharpen(&img.to_rgba8(), p)),
                 "cropImage" => crop(&img, p.crop_rect)?,
                 "editImage" => DynamicImage::ImageRgba8(apply_photo_edits(&img.to_rgba8(), p)),
                 "frameImage" => DynamicImage::ImageRgba8(apply_frame_bg(&img.to_rgba8(), p)),
@@ -763,6 +939,13 @@ mod tests {
     fn crop_edit_frame_redact() {
         let d = tempfile::tempdir().unwrap();
         let src = sample_png(d.path(), "a.png", 100, 50);
+        let up = execute_tool(
+            &[src.clone()],
+            "upscaleImage",
+            &ToolParams { collage_cols: 2, quality: 60, padding: 10, ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(dims(&up), (200, 100));
         let mut p = ToolParams::default();
         let c = execute_tool(&[src.clone()], "cropImage", &p).unwrap();
         assert_eq!(dims(&c), (80, 40));

@@ -53,11 +53,15 @@ pub fn copy_files(hwnd: HWND, paths: &[PathBuf]) {
     unsafe { set_clipboard(hwnd, CF_HDROP, &hdrop_bytes(paths)) }
 }
 
-fn copy_path(hwnd: HWND, paths: &[PathBuf]) {
-    let text: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
-    let mut w: Vec<u16> = text.join("\r\n").encode_utf16().collect();
+pub fn copy_text(hwnd: HWND, text: &str) {
+    let mut w: Vec<u16> = text.replace("\r\n", "\n").replace('\n', "\r\n").encode_utf16().collect();
     w.push(0);
     unsafe { set_clipboard(hwnd, CF_UNICODETEXT, &utf16_bytes(&w)) }
+}
+
+fn copy_path(hwnd: HWND, paths: &[PathBuf]) {
+    let text: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+    copy_text(hwnd, &text.join("\r\n"));
 }
 
 fn open_terminal(paths: &[PathBuf]) {

@@ -449,6 +449,11 @@ fn commit(hwnd: HWND) {
             };
             match execute_tool(&paths, &id, &params) {
                 Ok(o) => {
+                    if id == "extractText" {
+                        if let Ok(txt) = std::fs::read_to_string(&o) {
+                            actions::copy_text(hwnd, &txt);
+                        }
+                    }
                     println!("wrote {}", o.display());
                     outs.push(o);
                 }

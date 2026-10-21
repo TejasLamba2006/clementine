@@ -8,7 +8,7 @@ const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Clementine";
 const SETTINGS_KEY: &str = r"Software\Clementine";
 const APP: &str = "Clementine";
-pub const CURRENT_VERSION: &str = "0.2.0";
+pub const CURRENT_VERSION: &str = "0.2.1";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 
@@ -235,7 +235,7 @@ pub fn install_app(quiet: bool) -> Result<PathBuf, String> {
         set_str(k, "DisplayName", APP)?;
         set_str(k, "DisplayIcon", &format!("{exe},0"))?;
         set_str(k, "Publisher", "Tejas Lamba")?;
-        set_str(k, "DisplayVersion", "0.2.0")?;
+        set_str(k, "DisplayVersion", CURRENT_VERSION)?;
         set_str(k, "UninstallString", &format!("\"{exe}\" --uninstall"))?;
         set_dword(k, "NoModify", 1)?;
         set_dword(k, "NoRepair", 1)

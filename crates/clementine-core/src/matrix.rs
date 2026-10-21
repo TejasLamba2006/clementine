@@ -42,9 +42,11 @@ const DOC_CATEGORY: [&str; 12] = [
     "pdf", "ppt", "pptx", "docx", "pages", "md", "rtf", "rtfd", "textclipping", "txt", "html",
     "epub",
 ];
-const MULTI_TOOLS: [&str; 11] = [
+const MULTI_TOOLS: [&str; 13] = [
     "compress",
     "removeMetadata",
+    "extractText",
+    "upscaleImage",
     "cropImage",
     "normalizeAudio",
     "muteVideo",
@@ -134,12 +136,22 @@ pub fn tool_targets(ext: &str, count: usize) -> Vec<&'static str> {
     let raw: Vec<&'static str> = match ext.as_str() {
         "jpg" | "png" | "webp" | "heic" | "tiff" | "bmp" | "avif" => {
             if multi {
-                vec!["compress", "removeMetadata", "cropImage", "createPDF", "createCollage"]
+                vec![
+                    "compress",
+                    "removeMetadata",
+                    "extractText",
+                    "upscaleImage",
+                    "cropImage",
+                    "createPDF",
+                    "createCollage",
+                ]
             } else {
                 vec![
                     "compress",
                     "removeMetadata",
                     "removeBg",
+                    "upscaleImage",
+                    "extractText",
                     "editImage",
                     "annotateImage",
                     "frameImage",
@@ -192,9 +204,9 @@ pub fn tool_targets(ext: &str, count: usize) -> Vec<&'static str> {
         "gif" => vec!["removeMetadata"],
         "pdf" => {
             if multi {
-                vec!["compress", "removeMetadata", "splitPDF", "mergePDF"]
+                vec!["compress", "removeMetadata", "extractText", "splitPDF", "mergePDF"]
             } else {
-                vec!["compress", "removeMetadata", "splitPDF", "organizePDF"]
+                vec!["compress", "removeMetadata", "extractText", "splitPDF", "organizePDF"]
             }
         }
         "zip" | "tar" | "gz" | "rar" => vec!["extractArchive"],
@@ -220,10 +232,12 @@ const fn m(
     ToolMeta { id, title, name, symbol: id, is_action, description }
 }
 
-const TOOL_META: [ToolMeta; 33] = [
+const TOOL_META: [ToolMeta; 35] = [
     m("compress", "COMPRESS", "Compress", false, "Shrink file size"),
     m("removeMetadata", "METADATA", "Metadata", false, "Strip embedded metadata"),
     m("removeBg", "REMOVE BG", "Remove BG", false, "Remove background locally"),
+    m("upscaleImage", "UPSCALE", "Upscale & Sharpen", false, "Upscale 2x or 4x locally"),
+    m("extractText", "OCR TEXT", "Extract Text (OCR)", false, "Extract text offline"),
     m("editImage", "EDIT", "Edit Photo", false, "Adjust photo settings"),
     m("annotateImage", "ANNOTATE", "Annotate Photo", false, "Draw on the image"),
     m("frameImage", "ADD BG", "Add BG", false, "Add a background frame"),
@@ -299,6 +313,8 @@ fn tool_output(tool_id: &str, source_ext: &str) -> (&'static str, String) {
         "compress" => ("Compressed", if source_ext == "wav" { "flac".into() } else { src }),
         "removeMetadata" => ("No Metadata", src),
         "removeBg" => ("No BG", "png".into()),
+        "upscaleImage" => ("Upscaled", src),
+        "extractText" => ("OCR", "txt".into()),
         "editImage" => ("Edited", src),
         "annotateImage" => ("Annotated", "png".into()),
         "frameImage" => ("Background", src),
@@ -390,11 +406,21 @@ mod tests {
     #[test]
     fn tool_targets_rules() {
         assert!(tool_targets("jpg", 0).is_empty());
-        assert_eq!(tool_targets("jpg", 1).len(), 8);
+        assert_eq!(tool_targets("jpg", 1).len(), 10);
         assert!(tool_targets("jpg", 1).contains(&"removeBg"));
+        assert!(tool_targets("jpg", 1).contains(&"upscaleImage"));
+        assert!(tool_targets("jpg", 1).contains(&"extractText"));
         assert_eq!(
             tool_targets("jpg", 3),
-            vec!["compress", "removeMetadata", "cropImage", "createPDF", "createCollage"]
+            vec![
+                "compress",
+                "removeMetadata",
+                "extractText",
+                "upscaleImage",
+                "cropImage",
+                "createPDF",
+                "createCollage"
+            ]
         );
         assert_eq!(
             tool_targets("mp4", 2),
@@ -402,7 +428,7 @@ mod tests {
         );
         assert_eq!(
             tool_targets("pdf", 2),
-            vec!["compress", "removeMetadata", "splitPDF", "mergePDF"]
+            vec!["compress", "removeMetadata", "extractText", "splitPDF", "mergePDF"]
         );
         assert!(tool_targets("svg", 1).is_empty());
         assert_eq!(tool_targets("rar", 1), vec!["extractArchive"]);
@@ -410,7 +436,7 @@ mod tests {
 
     #[test]
     fn meta_covers_26_tools_and_6_actions() {
-        assert_eq!(TOOL_META.iter().filter(|t| !t.is_action).count(), 27);
+        assert_eq!(TOOL_META.iter().filter(|t| !t.is_action).count(), 29);
         let actions = action_targets();
         assert_eq!(actions.len(), 6);
         for a in &actions {

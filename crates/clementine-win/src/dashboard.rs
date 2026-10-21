@@ -185,7 +185,7 @@ pub fn render_dashboard() -> Vec<u32> {
     let (k_conv, k_tools, k_act) = hook::get_key_bindings();
     let cards = [
         (142.0, "Convert", "275 format paths", vk_name(k_conv), c8(255, 82, 0)),
-        (380.0, "File Tools", "27 local tools + Remove BG", vk_name(k_tools), c8(245, 158, 11)),
+        (380.0, "File Tools", "29 AI, OCR & media tools", vk_name(k_tools), c8(245, 158, 11)),
         (618.0, "File Actions", "Share, Float, Copy, Path", vk_name(k_act), c8(139, 92, 246)),
     ];
     for (cx, title, sub, kname, accent) in cards {

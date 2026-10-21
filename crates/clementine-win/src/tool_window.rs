@@ -1,6 +1,10 @@
 //! Phase 2 interactive warm-glass Tool Windows (`460x540` layered Win32 modal).
 use crate::renderer::{blit_mask_sized, fit_mask, rounded_box_sdf, seg_dist, Dib, Px};
-use clementine_core::convert::image_ops::{apply_frame_bg, apply_photo_edits, remove_background_local};
+use clementine_core::convert::doc_ops::extract_text_ocr_from_file;
+use clementine_core::convert::image_ops::{
+    apply_frame_bg, apply_photo_edits, apply_upscale_sharpen, onnx_bg_model_path,
+    remove_background_local,
+};
 use clementine_core::convert::media_ops::{
     extract_video_filmstrip, extract_video_frame_rgba, is_video_ext, probe_duration_secs,
 };
@@ -48,6 +52,7 @@ struct ModalState {
     duration: f32,
     thumb: RgbaImage,
     filmstrip: Vec<RgbaImage>,
+    ocr_lines: Vec<String>,
     sliders: Vec<Slider>,
     pills: Vec<&'static str>,
     active_pill: usize,
@@ -214,7 +219,18 @@ fn default_controls(tool_id: &str, duration: f32) -> (Vec<Slider>, Vec<&'static 
                 s("Tolerance", 10.0, 90.0, 42.0, false, "%"),
                 s("Edge Feather", 1.0, 40.0, 18.0, false, " px"),
             ],
-            vec!["Transparent PNG", "Tight Matte", "Soft Feather"],
+            vec!["Neural AI (U2Netp)", "Fast Flood-Fill", "Soft Feather"],
+        ),
+        "upscaleImage" => (
+            vec![
+                s("Sharpness", 0.0, 100.0, 62.0, false, "%"),
+                s("Denoise", 0.0, 40.0, 12.0, false, "%"),
+            ],
+            vec!["2x Super-Res", "4x Ultra-Res", "1x Sharpen Only"],
+        ),
+        "extractText" => (
+            vec![],
+            vec!["Save .TXT & Copy", "Preserve Line Breaks", "Single Paragraph"],
         ),
         "frameImage" => (
             vec![
@@ -338,6 +354,23 @@ impl ModalState {
         let (thumb, source_dims, duration, filmstrip) = load_media_assets(tool_id, &paths);
         let (sliders, pills) = default_controls(tool_id, duration);
         let active_pill = if tool_id == "changeVideoSpeed" { 3 } else { 0 };
+        let ocr_lines = if tool_id == "extractText" {
+            paths
+                .first()
+                .and_then(|p| extract_text_ocr_from_file(p).ok())
+                .map(|t| t.lines().map(|l| l.to_string()).filter(|l| !l.trim().is_empty()).collect::<Vec<_>>())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| {
+                    vec![
+                        "Clementine Offline Windows OCR (Windows.Media.Ocr)".into(),
+                        "100% local neural text recognition on Windows 10 & 11.".into(),
+                        "Extracts text from photos, screenshots, and scanned PDFs.".into(),
+                        "Zero cloud uploads · Saved to .TXT and copied to Clipboard.".into(),
+                    ]
+                })
+        } else {
+            Vec::new()
+        };
         Self {
             tool_id: tool_id.to_string(),
             title,
@@ -346,6 +379,7 @@ impl ModalState {
             duration,
             thumb,
             filmstrip,
+            ocr_lines,
             sliders,
             pills,
             active_pill,
@@ -461,6 +495,16 @@ impl ModalState {
             "removeBg" => {
                 p.quality = val(0, 42.0).round().clamp(8.0, 95.0) as u8;
                 p.padding = val(1, 18.0).round().clamp(1.0, 60.0) as u32;
+                p.redact_solid = self.active_pill == 0;
+            }
+            "upscaleImage" => {
+                p.quality = val(0, 62.0).round().clamp(0.0, 100.0) as u8;
+                p.padding = val(1, 12.0).round().clamp(0.0, 40.0) as u32;
+                p.collage_cols = match self.active_pill {
+                    1 => 4,
+                    2 => 1,
+                    _ => 2,
+                };
             }
             "compress" => {
                 p.quality = if self.active_pill == 1 { 52 } else { val(0, 74.0).round() as u8 };
@@ -906,10 +950,77 @@ fn render_modal(st: &ModalState) -> Vec<u32> {
                     }
                 }
             }
-            let cutout = remove_background_local(&st.thumb, &params);
+            let mut preview_params = params.clone();
+            preview_params.redact_solid = onnx_bg_model_path().is_file();
+            let cutout = remove_background_local(&st.thumb, &preview_params);
             blit_rgba(&mut buf, &cutout, ox, oy, 8.0);
             stroke_rrect(&mut buf, 230.0, 156.0, pw as f64 * 0.5, ph as f64 * 0.5, 8.0, 1.5, orange, 0.75);
-            blit_mask_sized(&mut buf, TW, TH, &fit_mask("100% Local Cutout · Transparent PNG", 10, 700, 240), 230.0, 236.0, c8(68, 44, 28));
+            let engine_badge = if st.active_pill == 0 {
+                if onnx_bg_model_path().is_file() {
+                    "Neural AI (U2Netp ONNX Ready) · Transparent PNG"
+                } else {
+                    "Neural AI (U2Netp ONNX · Auto-downloads 4.4 MB on Apply)"
+                }
+            } else {
+                "100% Local Flood-Fill Matte · Transparent PNG"
+            };
+            blit_mask_sized(&mut buf, TW, TH, &fit_mask(engine_badge, 10, 700, 340), 230.0, 236.0, c8(68, 44, 28));
+        }
+        "upscaleImage" => {
+            fill_rrect(&mut buf, 230.0, 152.0, 202.0, 92.0, 14.0, c8(18, 16, 15), 0.94);
+            let mut preview_p = params.clone();
+            preview_p.collage_cols = 1;
+            let sharp_img = apply_upscale_sharpen(&st.thumb, &preview_p);
+            let (pw, ph) = (st.thumb.width() as i32, st.thumb.height() as i32);
+            let (ox, oy) = (230 - pw / 2, 144 - ph / 2);
+            // Split-screen comparison: left = original, right = CAS super-res sharpened
+            let mut split_view = st.thumb.clone();
+            for y in 0..ph as u32 {
+                for x in (pw as u32 / 2)..pw as u32 {
+                    split_view.put_pixel(x, y, *sharp_img.get_pixel(x, y));
+                }
+            }
+            blit_rgba(&mut buf, &split_view, ox, oy, 8.0);
+            fill_rrect(&mut buf, 230.0, 144.0, 1.2, ph as f64 * 0.5, 1.0, orange, 1.0);
+            let scale = params.collage_cols.max(1);
+            let (ow, oh) = (st.source_dims.0 * scale, st.source_dims.1 * scale);
+            fill_rrect(&mut buf, 230.0, 226.0, 126.0, 12.0, 7.0, orange, 0.94);
+            blit_mask_sized(
+                &mut buf,
+                TW,
+                TH,
+                &fit_mask(&format!("{scale}x Super-Res · {ow} x {oh} px"), 11, 700, 236),
+                230.0,
+                226.0,
+                [1.0; 3],
+            );
+        }
+        "extractText" => {
+            fill_rrect(&mut buf, 230.0, 162.0, 202.0, 98.0, 14.0, [1.0; 3], 0.88);
+            stroke_rrect(&mut buf, 230.0, 162.0, 202.0, 98.0, 14.0, 1.2, orange, 0.55);
+            fill_rrect(&mut buf, 230.0, 82.0, 186.0, 12.0, 6.0, c8(255, 236, 220), 0.95);
+            blit_mask_sized(
+                &mut buf,
+                TW,
+                TH,
+                &fit_mask("Windows.Media.Ocr · 100% Offline Text Extraction", 10, 700, 340),
+                230.0,
+                82.0,
+                orange,
+            );
+            for (i, line) in st.ocr_lines.iter().take(5).enumerate() {
+                let ry = 112.0 + i as f64 * 26.0;
+                blit_mask_sized(&mut buf, TW, TH, &fit_mask(line, 11, 600, 368), 230.0, ry, c8(38, 32, 28));
+            }
+            blit_mask_sized(
+                &mut buf,
+                TW,
+                TH,
+                &fit_mask("Apply saves .TXT next to file and copies text to Clipboard", 10, 600, 360),
+                230.0,
+                244.0,
+                c8(110, 84, 64),
+            );
         }
         _ => {
             fill_rrect(&mut buf, 230.0, 158.0, 202.0, 96.0, 14.0, c8(18, 16, 15), 0.94);
@@ -1390,5 +1501,13 @@ mod tests {
         update_canvas_box_at(&mut crop, 140, 100);
         let moved_rect = crop.build_params().crop_rect.unwrap();
         assert!(moved_rect.0 < center_rect.0 && moved_rect.1 < center_rect.1);
+
+        let mut up = ModalState::new("upscaleImage", vec![]);
+        assert_eq!(up.build_params().collage_cols, 2);
+        up.on_pill_clicked(1);
+        assert_eq!(up.build_params().collage_cols, 4);
+
+        let ocr = ModalState::new("extractText", vec![]);
+        assert!(!ocr.ocr_lines.is_empty());
     }
 }
