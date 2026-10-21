@@ -25,12 +25,18 @@ pub struct ActivityItem {
 }
 
 static RECENT: Mutex<Vec<ActivityItem>> = Mutex::new(Vec::new());
+static UPDATE_STATUS: Mutex<String> = Mutex::new(String::new());
 static SOUND_ENABLED: AtomicBool = AtomicBool::new(true);
 static DASH_HWND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static WHEEL_HWND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub fn is_sound_enabled() -> bool {
     SOUND_ENABLED.load(Relaxed)
+}
+
+pub fn set_update_status(status: String) {
+    *UPDATE_STATUS.lock().unwrap() = status;
+    refresh();
 }
 
 pub fn record_activity(title: String, detail: String, path: PathBuf) {
@@ -179,7 +185,7 @@ pub fn render_dashboard() -> Vec<u32> {
     let (k_conv, k_tools, k_act) = hook::get_key_bindings();
     let cards = [
         (142.0, "Convert", "275 format paths", vk_name(k_conv), c8(255, 82, 0)),
-        (380.0, "File Tools", "26 editing & PDF tools", vk_name(k_tools), c8(245, 158, 11)),
+        (380.0, "File Tools", "27 local tools + Remove BG", vk_name(k_tools), c8(245, 158, 11)),
         (618.0, "File Actions", "Share, Float, Copy, Path", vk_name(k_act), c8(139, 92, 246)),
     ];
     for (cx, title, sub, kname, accent) in cards {
@@ -237,16 +243,25 @@ pub fn render_dashboard() -> Vec<u32> {
     stroke_rrect(&mut buf, 560.0, 431.0, 170.0, 37.0, 14.0, 1.0, card_border, 0.85);
     let startup_on = install::is_startup_enabled();
     let sound_on = SOUND_ENABLED.load(Relaxed);
+    let upd_txt = {
+        let s = UPDATE_STATUS.lock().unwrap().clone();
+        if s.is_empty() { "Check Updates".to_string() } else { s }
+    };
 
-    // Toggle 1: Run at Windows Startup (475, 431)
-    fill_rrect(&mut buf, 476.0, 431.0, 74.0, 18.0, 9.0, if startup_on { c8(22, 62, 38) } else { c8(38, 40, 46) }, 1.0);
-    stroke_rrect(&mut buf, 476.0, 431.0, 74.0, 18.0, 9.0, 1.0, if startup_on { green } else { card_border }, 0.8);
-    blit_mask_sized(&mut buf, DW, DH, &fit_mask(if startup_on { "Startup: ON" } else { "Startup: OFF" }, 11, 700, 130), 476.0, 431.0, [1.0; 3]);
+    // Toggle 1: Run at Windows Startup (448, 431)
+    fill_rrect(&mut buf, 448.0, 431.0, 50.0, 18.0, 9.0, if startup_on { c8(22, 62, 38) } else { c8(38, 40, 46) }, 1.0);
+    stroke_rrect(&mut buf, 448.0, 431.0, 50.0, 18.0, 9.0, 1.0, if startup_on { green } else { card_border }, 0.8);
+    blit_mask_sized(&mut buf, DW, DH, &fit_mask(if startup_on { "Startup: ON" } else { "Startup: OFF" }, 10, 700, 92), 448.0, 431.0, [1.0; 3]);
 
-    // Toggle 2: Sound Feedback (644, 431)
-    fill_rrect(&mut buf, 644.0, 431.0, 74.0, 18.0, 9.0, if sound_on { c8(68, 34, 20) } else { c8(38, 40, 46) }, 1.0);
-    stroke_rrect(&mut buf, 644.0, 431.0, 74.0, 18.0, 9.0, 1.0, if sound_on { orange } else { card_border }, 0.8);
-    blit_mask_sized(&mut buf, DW, DH, &fit_mask(if sound_on { "Sound: ON" } else { "Sound: OFF" }, 11, 700, 130), 644.0, 431.0, [1.0; 3]);
+    // Toggle 2: Sound Feedback (556, 431)
+    fill_rrect(&mut buf, 556.0, 431.0, 48.0, 18.0, 9.0, if sound_on { c8(68, 34, 20) } else { c8(38, 40, 46) }, 1.0);
+    stroke_rrect(&mut buf, 556.0, 431.0, 48.0, 18.0, 9.0, 1.0, if sound_on { orange } else { card_border }, 0.8);
+    blit_mask_sized(&mut buf, DW, DH, &fit_mask(if sound_on { "Sound: ON" } else { "Sound: OFF" }, 10, 700, 88), 556.0, 431.0, [1.0; 3]);
+
+    // Button 3: Check for Updates from GitHub (666, 431)
+    fill_rrect(&mut buf, 666.0, 431.0, 54.0, 18.0, 9.0, c8(38, 40, 46), 1.0);
+    stroke_rrect(&mut buf, 666.0, 431.0, 54.0, 18.0, 9.0, 1.0, orange, 0.75);
+    blit_mask_sized(&mut buf, DW, DH, &fit_mask(&upd_txt, 10, 700, 100), 666.0, 431.0, [1.0; 3]);
 
     // Footer status line
     blit_mask_sized(
@@ -331,19 +346,24 @@ unsafe extern "system" fn dash_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM) 
                     return 0;
                 }
             }
-            // 4. Startup toggle (402..550, 412..450)
-            if (402..=550).contains(&mx) && (412..=450).contains(&my) {
+            // 4. Startup toggle (398..498, 412..450)
+            if (398..=498).contains(&mx) && (412..=450).contains(&my) {
                 let inst = install::installed_exe_path();
                 let exe = if inst.exists() { inst } else { std::env::current_exe().unwrap_or_default() };
                 let _ = install::set_startup_enabled(!install::is_startup_enabled(), &exe);
                 present_dashboard(hwnd);
                 return 0;
             }
-            // 5. Sound toggle (570..718, 412..450)
-            if (570..=718).contains(&mx) && (412..=450).contains(&my) {
+            // 5. Sound toggle (508..604, 412..450)
+            if (508..=604).contains(&mx) && (412..=450).contains(&my) {
                 let cur = SOUND_ENABLED.load(Relaxed);
                 SOUND_ENABLED.store(!cur, Relaxed);
                 present_dashboard(hwnd);
+                return 0;
+            }
+            // 5b. Check for Updates button (612..720, 412..450)
+            if (612..=720).contains(&mx) && (412..=450).contains(&my) {
+                install::check_for_updates(false);
                 return 0;
             }
             // 6. Recent activity item click -> reveal in Explorer

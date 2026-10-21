@@ -353,6 +353,139 @@ pub fn apply_photo_edits(img: &RgbaImage, p: &ToolParams) -> RgbaImage {
     out
 }
 
+/// 100% local border-floodfill + perceptual chroma/luma edge-matting background removal.
+/// Uses `p.quality` (10..=90, default 42) as color tolerance and `p.padding` (0..=40, default 18) as soft edge feathering.
+pub fn remove_background_local(img: &RgbaImage, p: &ToolParams) -> RgbaImage {
+    let (w, h) = img.dimensions();
+    if w < 2 || h < 2 {
+        return img.clone();
+    }
+    let tol = (p.quality.clamp(8, 95) as f32) * 1.45;
+    let feather = (p.padding.clamp(1, 60) as f32) * 1.25;
+
+    // 1. Sample perimeter border pixels to build background reference colors
+    let mut samples: Vec<[f32; 3]> = Vec::new();
+    let step_x = (w / 12).max(1);
+    let step_y = (h / 12).max(1);
+    for x in (0..w).step_by(step_x as usize) {
+        for y in [0, h - 1] {
+            let px = img.get_pixel(x, y).0;
+            samples.push([px[0] as f32, px[1] as f32, px[2] as f32]);
+        }
+    }
+    for y in (0..h).step_by(step_y as usize) {
+        for x in [0, w - 1] {
+            let px = img.get_pixel(x, y).0;
+            samples.push([px[0] as f32, px[1] as f32, px[2] as f32]);
+        }
+    }
+
+    let color_dist = |a: [u8; 4], b: [f32; 3]| -> f32 {
+        let rm = (a[0] as f32 + b[0]) * 0.5 / 255.0;
+        let dr = a[0] as f32 - b[0];
+        let dg = a[1] as f32 - b[1];
+        let db = a[2] as f32 - b[2];
+        (((2.0 + rm) * dr * dr + 4.0 * dg * dg + (3.0 - rm) * db * db) / 9.0).sqrt()
+    };
+
+    let min_bg_dist = |px: [u8; 4]| -> f32 {
+        samples
+            .iter()
+            .map(|&s| color_dist(px, s))
+            .fold(f32::MAX, f32::min)
+    };
+
+    // 2. Flood-fill connected background from image borders
+    let n = (w * h) as usize;
+    let mut visited = vec![false; n];
+    let mut is_bg = vec![false; n];
+    let mut queue = std::collections::VecDeque::new();
+
+    for x in 0..w {
+        for y in [0, h - 1] {
+            let idx = (y * w + x) as usize;
+            if !visited[idx] {
+                visited[idx] = true;
+                if min_bg_dist(img.get_pixel(x, y).0) <= tol + feather * 0.5 {
+                    is_bg[idx] = true;
+                    queue.push_back((x, y));
+                }
+            }
+        }
+    }
+    for y in 0..h {
+        for x in [0, w - 1] {
+            let idx = (y * w + x) as usize;
+            if !visited[idx] {
+                visited[idx] = true;
+                if min_bg_dist(img.get_pixel(x, y).0) <= tol + feather * 0.5 {
+                    is_bg[idx] = true;
+                    queue.push_back((x, y));
+                }
+            }
+        }
+    }
+
+    while let Some((cx, cy)) = queue.pop_front() {
+        let cur_px = img.get_pixel(cx, cy).0;
+        let cur_f = [cur_px[0] as f32, cur_px[1] as f32, cur_px[2] as f32];
+        for (dx, dy) in [(-1i32, 0), (1, 0), (0, -1), (0, 1)] {
+            let (nx, ny) = (cx as i32 + dx, cy as i32 + dy);
+            if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                continue;
+            }
+            let (nx, ny) = (nx as u32, ny as u32);
+            let idx = (ny * w + nx) as usize;
+            if visited[idx] {
+                continue;
+            }
+            let npx = img.get_pixel(nx, ny).0;
+            let d_global = min_bg_dist(npx);
+            let d_step = color_dist(npx, cur_f);
+            if d_global <= tol && d_step <= 28.0 {
+                visited[idx] = true;
+                is_bg[idx] = true;
+                queue.push_back((nx, ny));
+            }
+        }
+    }
+
+    // 3. Compute soft alpha matte with edge feathering
+    let mut out = img.clone();
+    for y in 0..h {
+        for x in 0..w {
+            let idx = (y * w + x) as usize;
+            let px = out.get_pixel_mut(x, y);
+            let d = min_bg_dist(px.0);
+            if is_bg[idx] {
+                if d <= tol * 0.75 {
+                    px.0[3] = 0;
+                } else {
+                    let t = ((d - tol * 0.75) / feather.max(1.0)).clamp(0.0, 1.0);
+                    px.0[3] = ((px.0[3] as f32) * t * t).round() as u8;
+                }
+            } else if d < tol + feather {
+                // Check if adjacent to background for smooth anti-aliased boundary
+                let mut adj_bg = false;
+                for (dx, dy) in [(-1i32, 0), (1, 0), (0, -1), (0, 1)] {
+                    let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                    if nx >= 0 && ny >= 0 && nx < w as i32 && ny < h as i32 {
+                        if is_bg[(ny as u32 * w + nx as u32) as usize] {
+                            adj_bg = true;
+                            break;
+                        }
+                    }
+                }
+                if adj_bg {
+                    let t = ((d - tol * 0.6) / (feather * 1.4).max(1.0)).clamp(0.15, 1.0);
+                    px.0[3] = ((px.0[3] as f32) * t).round() as u8;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Background canvas with padding, rounded card and blurred drop shadow.
 pub fn apply_frame_bg(img: &RgbaImage, p: &ToolParams) -> RgbaImage {
     let (w, h) = img.dimensions();
@@ -538,6 +671,7 @@ pub fn tool(job: &[PathBuf], tool_id: &str, p: &ToolParams, out: &Path) -> Resul
             let img = match tool_id {
                 "compress" => shrink(img, &ext, p),
                 "removeMetadata" => img,
+                "removeBg" => DynamicImage::ImageRgba8(remove_background_local(&img.to_rgba8(), p)),
                 "cropImage" => crop(&img, p.crop_rect)?,
                 "editImage" => DynamicImage::ImageRgba8(apply_photo_edits(&img.to_rgba8(), p)),
                 "frameImage" => DynamicImage::ImageRgba8(apply_frame_bg(&img.to_rgba8(), p)),

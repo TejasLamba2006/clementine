@@ -6,7 +6,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATIO
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Clementine";
+const SETTINGS_KEY: &str = r"Software\Clementine";
 const APP: &str = "Clementine";
+pub const CURRENT_VERSION: &str = "0.2.0";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 
@@ -87,6 +89,107 @@ pub fn is_startup_enabled() -> bool {
 
 pub fn set_startup_enabled(enable: bool, exe_path: &Path) -> Result<(), String> {
     set_run_value(APP, enable, exe_path)
+}
+
+pub fn is_auto_update_enabled() -> bool {
+    let Some(k) = open_key(SETTINGS_KEY, KEY_READ) else { return true };
+    let mut val: u32 = 1;
+    let mut sz: u32 = 4;
+    let r = unsafe {
+        RegQueryValueExW(
+            k,
+            w("AutoUpdate").as_ptr(),
+            null(),
+            null_mut(),
+            &mut val as *mut u32 as *mut u8,
+            &mut sz,
+        )
+    };
+    unsafe { RegCloseKey(k) };
+    if r == 0 { val != 0 } else { true }
+}
+
+pub fn set_auto_update_enabled(enable: bool) {
+    if let Ok(k) = create_key(SETTINGS_KEY) {
+        let _ = set_dword(k, "AutoUpdate", u32::from(enable));
+        unsafe { RegCloseKey(k) };
+    }
+}
+
+pub fn parse_semver(s: &str) -> (u32, u32, u32) {
+    let clean = s.trim().trim_start_matches(['v', 'V']);
+    let mut it = clean.split(['.', '-']);
+    let a = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    let b = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    let c = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    (a, b, c)
+}
+
+pub fn is_newer_version(remote: &str, local: &str) -> bool {
+    parse_semver(remote) > parse_semver(local)
+}
+
+pub fn check_for_updates(silent: bool) {
+    std::thread::spawn(move || {
+        crate::dashboard::set_update_status("Checking GitHub...".into());
+        let ps = "$ProgressPreference='SilentlyContinue'; \
+                  $r = Invoke-RestMethod -Uri 'https://api.github.com/repos/TejasLamba2006/clementine/releases/latest' -Headers @{'User-Agent'='Clementine-Updater'} -TimeoutSec 10; \
+                  $a = $r.assets | Where-Object { $_.name -like '*Setup*.exe' -or $_.name -eq 'clementine.exe' } | Select-Object -First 1; \
+                  Write-Output \"$($r.tag_name)|$($a.browser_download_url)\"";
+        let out = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        let Ok(out) = out else {
+            crate::dashboard::set_update_status(format!("v{CURRENT_VERSION} (Offline)"));
+            if !silent {
+                message("Could not reach GitHub Releases to check for updates.");
+            }
+            return;
+        };
+        let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let (tag, url) = line.split_once('|').unwrap_or((&line, ""));
+        if tag.is_empty() {
+            crate::dashboard::set_update_status(format!("Up to date (v{CURRENT_VERSION})"));
+            if !silent {
+                message(&format!("Clementine v{CURRENT_VERSION} is up to date!"));
+            }
+            return;
+        }
+        if is_newer_version(tag, CURRENT_VERSION) && !url.is_empty() {
+            crate::dashboard::set_update_status(format!("Updating to {tag}..."));
+            let tmp = std::env::temp_dir().join("Clementine-Setup-Update.exe");
+            let dl = format!(
+                "$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri '{}' -OutFile '{}' -TimeoutSec 30",
+                url.replace('\'', "''"),
+                tmp.display().to_string().replace('\'', "''")
+            );
+            let ok = std::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &dl])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if ok && tmp.exists() {
+                crate::dashboard::set_update_status(format!("Updated to {tag}!"));
+                if !silent {
+                    message(&format!("Downloaded Clementine {tag} from GitHub Releases.\nApplying update and restarting now..."));
+                }
+                let _ = std::process::Command::new(&tmp)
+                    .arg("--install-quiet")
+                    .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+                    .spawn();
+                return;
+            }
+        }
+        crate::dashboard::set_update_status(format!("Up to date (v{CURRENT_VERSION})"));
+        if !silent {
+            message(&format!(
+                "Clementine v{CURRENT_VERSION} is up to date!\n\nLatest GitHub Release: {tag}\nAuto-update on startup: {}",
+                if is_auto_update_enabled() { "Enabled" } else { "Disabled" }
+            ));
+        }
+    });
 }
 
 fn message(text: &str) {
@@ -183,5 +286,8 @@ mod tests {
         assert!(run_value_exists(name));
         set_run_value(name, false, exe).unwrap();
         assert!(!run_value_exists(name));
+        assert!(is_newer_version("v0.3.0", "0.2.0"));
+        assert!(!is_newer_version("v0.2.0", "0.2.0"));
+        assert!(!is_newer_version("v0.1.0", "0.2.0"));
     }
 }

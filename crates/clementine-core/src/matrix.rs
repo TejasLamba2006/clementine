@@ -132,13 +132,14 @@ pub fn tool_targets(ext: &str, count: usize) -> Vec<&'static str> {
     let ext = norm(ext);
     let multi = count > 1;
     let raw: Vec<&'static str> = match ext.as_str() {
-        "jpg" | "png" | "webp" | "heic" | "tiff" => {
+        "jpg" | "png" | "webp" | "heic" | "tiff" | "bmp" | "avif" => {
             if multi {
                 vec!["compress", "removeMetadata", "cropImage", "createPDF", "createCollage"]
             } else {
                 vec![
                     "compress",
                     "removeMetadata",
+                    "removeBg",
                     "editImage",
                     "annotateImage",
                     "frameImage",
@@ -219,9 +220,10 @@ const fn m(
     ToolMeta { id, title, name, symbol: id, is_action, description }
 }
 
-const TOOL_META: [ToolMeta; 32] = [
+const TOOL_META: [ToolMeta; 33] = [
     m("compress", "COMPRESS", "Compress", false, "Shrink file size"),
     m("removeMetadata", "METADATA", "Metadata", false, "Strip embedded metadata"),
+    m("removeBg", "REMOVE BG", "Remove BG", false, "Remove background locally"),
     m("editImage", "EDIT", "Edit Photo", false, "Adjust photo settings"),
     m("annotateImage", "ANNOTATE", "Annotate Photo", false, "Draw on the image"),
     m("frameImage", "ADD BG", "Add BG", false, "Add a background frame"),
@@ -296,6 +298,7 @@ fn tool_output(tool_id: &str, source_ext: &str) -> (&'static str, String) {
     match tool_id {
         "compress" => ("Compressed", if source_ext == "wav" { "flac".into() } else { src }),
         "removeMetadata" => ("No Metadata", src),
+        "removeBg" => ("No BG", "png".into()),
         "editImage" => ("Edited", src),
         "annotateImage" => ("Annotated", "png".into()),
         "frameImage" => ("Background", src),
@@ -387,7 +390,8 @@ mod tests {
     #[test]
     fn tool_targets_rules() {
         assert!(tool_targets("jpg", 0).is_empty());
-        assert_eq!(tool_targets("jpg", 1).len(), 7);
+        assert_eq!(tool_targets("jpg", 1).len(), 8);
+        assert!(tool_targets("jpg", 1).contains(&"removeBg"));
         assert_eq!(
             tool_targets("jpg", 3),
             vec!["compress", "removeMetadata", "cropImage", "createPDF", "createCollage"]
@@ -406,7 +410,7 @@ mod tests {
 
     #[test]
     fn meta_covers_26_tools_and_6_actions() {
-        assert_eq!(TOOL_META.iter().filter(|t| !t.is_action).count(), 26);
+        assert_eq!(TOOL_META.iter().filter(|t| !t.is_action).count(), 27);
         let actions = action_targets();
         assert_eq!(actions.len(), 6);
         for a in &actions {

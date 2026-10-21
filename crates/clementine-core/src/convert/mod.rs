@@ -256,7 +256,7 @@ fn dispatch(
 ) -> Result<()> {
     let unsupported = || ClementineError::UnsupportedTool(tool_id.to_string());
     match tool_id {
-        "editImage" | "annotateImage" | "cropImage" | "frameImage" | "redactImage"
+        "removeBg" | "editImage" | "annotateImage" | "cropImage" | "frameImage" | "redactImage"
         | "createPDF" | "createCollage" => image_ops::tool(job, tool_id, params, out),
         "compress" | "removeMetadata" => {
             if image_ops::is_image_ext(ext) {

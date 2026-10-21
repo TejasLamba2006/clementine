@@ -635,11 +635,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM) -
             } else if matches!(lp as u32, WM_RBUTTONUP | WM_CONTEXTMENU) {
                 let menu = CreatePopupMenu();
                 let on = if install::is_startup_enabled() { MF_CHECKED } else { MF_UNCHECKED };
+                let auto_up = if install::is_auto_update_enabled() { MF_CHECKED } else { MF_UNCHECKED };
                 for (id, s, f) in [
                     (6, "Open Clementine Dashboard", MF_STRING),
                     (1, "Open Demo Wheel", MF_STRING),
                     (2, "Show Floating Shelf", MF_STRING),
                     (3, "Run at Windows Startup", MF_STRING | on),
+                    (8, "Auto-Update from GitHub", MF_STRING | auto_up),
+                    (7, "Check for Updates...", MF_STRING),
                     (4, "Install to Start Menu & Programs", MF_STRING),
                     (5, "Quit Clementine", MF_STRING),
                 ] {
@@ -676,6 +679,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM) -
                         eprintln!("install failed: {e}");
                     }
                 }
+                7 => install::check_for_updates(false),
+                8 => install::set_auto_update_enabled(!install::is_auto_update_enabled()),
                 5 => PostQuitMessage(0),
                 _ => {}
             }
@@ -1280,6 +1285,9 @@ fn main() {
             drop_target::register(h);
             hook::install(h as usize);
             add_tray(h);
+            if install::is_auto_update_enabled() {
+                install::check_for_updates(true);
+            }
             if a.get(1).map(|s| s.as_str()) != Some("--startup") {
                 dashboard::show(h);
             }

@@ -21,4 +21,16 @@
 .file-progress-bar>i{display:block;height:100%;width:100%;border-radius:999px;background:linear-gradient(90deg,#ff5200,#ff944d);transform-origin:left center;animation:file-bar-fill .78s cubic-bezier(.22,.8,.26,1) forwards}
 @keyframes hud-shimmer{0%{background-position:100% 0}to{background-position:-100% 0}}
 @keyframes file-bar-fill{0%{transform:scaleX(.06)}to{transform:scaleX(1)}}
+.win-native{margin-top:96px;display:grid;grid-template-columns:1.1fr .9fr;gap:36px;align-items:center}
+.win-native-card{background:#131417;border-radius:24px;padding:16px;box-shadow:0 24px 60px rgba(0,0,0,.18);border:1px solid rgba(255,255,255,.08)}
+.win-native-card img{width:100%;height:auto;display:block;border-radius:14px}
+.win-native-copy .privacy-eyebrow{color:#ff5200;font-weight:700;text-transform:uppercase;letter-spacing:.08em;font-size:12px;margin-bottom:8px}
+.win-native-copy h2{font-size:clamp(28px,3.6vw,40px);line-height:1.12;margin:0 0 14px}
+.win-native-copy>p{color:#555;line-height:1.6;margin:0 0 20px}
+.win-pillars{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.win-pillar{background:#f7f6f3;border-radius:16px;padding:16px;border:1px solid rgba(0,0,0,.06)}
+.win-pillar strong{display:block;font-size:15px;color:#111;margin-bottom:4px}
+.win-pillar span{font-size:13px;line-height:1.45;color:#585858;display:block}
+@media(max-width:860px){.win-native{grid-template-columns:1fr}.win-pillars{grid-template-columns:1fr}}
+
 

@@ -1,6 +1,6 @@
 //! Phase 2 interactive warm-glass Tool Windows (`460x540` layered Win32 modal).
 use crate::renderer::{blit_mask_sized, fit_mask, rounded_box_sdf, seg_dist, Dib, Px};
-use clementine_core::convert::image_ops::{apply_frame_bg, apply_photo_edits};
+use clementine_core::convert::image_ops::{apply_frame_bg, apply_photo_edits, remove_background_local};
 use clementine_core::convert::media_ops::{
     extract_video_filmstrip, extract_video_frame_rgba, is_video_ext, probe_duration_secs,
 };
@@ -209,6 +209,13 @@ fn default_controls(tool_id: &str, duration: f32) -> (Vec<Slider>, Vec<&'static 
             ],
             vec![],
         ),
+        "removeBg" => (
+            vec![
+                s("Tolerance", 10.0, 90.0, 42.0, false, "%"),
+                s("Edge Feather", 1.0, 40.0, 18.0, false, " px"),
+            ],
+            vec!["Transparent PNG", "Tight Matte", "Soft Feather"],
+        ),
         "frameImage" => (
             vec![
                 s("Padding", 8.0, 96.0, 36.0, false, " px"),
@@ -411,6 +418,15 @@ impl ModalState {
                     _ => 2.0,
                 };
             }
+            "removeBg" if self.sliders.len() >= 2 => {
+                let (tol, fth) = match pill_idx {
+                    1 => (32.0, 6.0),
+                    2 => (52.0, 32.0),
+                    _ => (42.0, 18.0),
+                };
+                self.sliders[0].val = tol;
+                self.sliders[1].val = fth;
+            }
             _ => {}
         }
     }
@@ -441,6 +457,10 @@ impl ModalState {
                 p.padding = val(0, 36.0).round() as u32;
                 p.corner_radius = val(1, 20.0).round() as u32;
                 p.shadow = val(2, 26.0).round() as u32;
+            }
+            "removeBg" => {
+                p.quality = val(0, 42.0).round().clamp(8.0, 95.0) as u8;
+                p.padding = val(1, 18.0).round().clamp(1.0, 60.0) as u32;
             }
             "compress" => {
                 p.quality = if self.active_pill == 1 { 52 } else { val(0, 74.0).round() as u8 };
@@ -871,6 +891,25 @@ fn render_modal(st: &ModalState) -> Vec<u32> {
             let pad = (params.padding as i32 / 3).clamp(4, 34);
             let inner = imageops::resize(&st.thumb, (240 - pad as u32 * 2).max(60), (160 - pad as u32 * 2).max(40), imageops::FilterType::Triangle);
             blit_rgba(&mut buf, &inner, 230 - inner.width() as i32 / 2, 158 - inner.height() as i32 / 2, (params.corner_radius as f64 * 0.5).clamp(2.0, 22.0));
+        }
+        "removeBg" => {
+            // Checkerboard transparency backdrop + live local foreground cutout
+            let (pw, ph) = (st.thumb.width() as i32, st.thumb.height() as i32);
+            let (ox, oy) = (230 - pw / 2, 156 - ph / 2);
+            for y in 0..ph {
+                for x in 0..pw {
+                    let (gx, gy) = (ox + x, oy + y);
+                    if gx >= 0 && gy >= 0 && gx < TW as i32 && gy < TH as i32 {
+                        let cell = ((x / 10) + (y / 10)) & 1 == 0;
+                        let col = if cell { c8(242, 240, 236) } else { c8(208, 204, 198) };
+                        over(&mut buf[gy as usize * TW + gx as usize], col, 0.96);
+                    }
+                }
+            }
+            let cutout = remove_background_local(&st.thumb, &params);
+            blit_rgba(&mut buf, &cutout, ox, oy, 8.0);
+            stroke_rrect(&mut buf, 230.0, 156.0, pw as f64 * 0.5, ph as f64 * 0.5, 8.0, 1.5, orange, 0.75);
+            blit_mask_sized(&mut buf, TW, TH, &fit_mask("100% Local Cutout · Transparent PNG", 10, 700, 240), 230.0, 236.0, c8(68, 44, 28));
         }
         _ => {
             fill_rrect(&mut buf, 230.0, 158.0, 202.0, 96.0, 14.0, c8(18, 16, 15), 0.94);
