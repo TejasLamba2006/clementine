@@ -85,6 +85,14 @@ pub struct ToolParams {
     pub split_points: Vec<f32>,
     /// `videoSnapshots`: timestamps in seconds to export as PNG frames.
     pub snapshot_times: Vec<f32>,
+    /// `redactImage` / `redactVideo`: multiple `(x, y, w, h)` regions (e.g. from local FaceDetector / OCR).
+    pub redact_rects: Vec<(u32, u32, u32, u32)>,
+    /// `organizePDF`: per-page clockwise rotation in degrees (`0`, `90`, `180`, `270`).
+    pub page_rotations: Vec<u16>,
+    /// `removeMetadata`: optional `(Title, Author_Artist, Copyright_Comment)` tags to write instead of stripping all.
+    pub custom_metadata: Option<(String, String, String)>,
+    /// `redactAudio`: when true, replaces the range with a 1 kHz censor beep instead of silence.
+    pub bleep_tone: bool,
 }
 
 impl Default for ToolParams {
@@ -121,6 +129,10 @@ impl Default for ToolParams {
             visualizer_bars: false,
             split_points: vec![],
             snapshot_times: vec![],
+            redact_rects: vec![],
+            page_rotations: vec![],
+            custom_metadata: None,
+            bleep_tone: false,
         }
     }
 }
@@ -267,14 +279,14 @@ fn dispatch(
             if image_ops::is_image_ext(ext) {
                 image_ops::tool(job, tool_id, params, out)
             } else if ext == "pdf" {
-                doc_ops::clean_pdf(&job[0], out)
+                doc_ops::clean_or_tag_pdf(&job[0], params.custom_metadata.as_ref(), out)
             } else if media_ops::is_media_ext(ext) {
                 media_ops::run_tool(job, tool_id, params, out)
             } else {
                 Err(unsupported())
             }
         }
-        "organizePDF" => doc_ops::organize_pdf(&job[0], &params.page_order, out),
+        "organizePDF" => doc_ops::organize_pdf_with_rotations(&job[0], &params.page_order, &params.page_rotations, out),
         "splitPDF" => doc_ops::split_pdf(&job[0], out),
         "mergePDF" => {
             if params.page_order.is_empty() {

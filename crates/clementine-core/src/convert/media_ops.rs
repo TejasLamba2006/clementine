@@ -95,7 +95,24 @@ pub fn build_ffmpeg_args(inputs: &[PathBuf], op: &str, params: &ToolParams, out:
         } else {
             s(&["-b:a", "96k"])
         }),
-        "removeMetadata" => a.extend(s(&["-map_metadata", "-1", "-c", "copy"])),
+        "removeMetadata" => {
+            if let Some((title, author, comment)) = &params.custom_metadata {
+                a.extend(s(&[
+                    "-map_metadata",
+                    "-1",
+                    "-metadata",
+                    &format!("title={title}"),
+                    "-metadata",
+                    &format!("artist={author}"),
+                    "-metadata",
+                    &format!("comment={comment}"),
+                    "-c",
+                    "copy",
+                ]));
+            } else {
+                a.extend(s(&["-map_metadata", "-1", "-c", "copy"]));
+            }
+        }
         "muteVideo" => a.extend(s(&["-an", "-c:v", "copy"])),
         "trimVideo" => times(&mut a),
         "trimAudio" => {
@@ -163,9 +180,18 @@ pub fn build_ffmpeg_args(inputs: &[PathBuf], op: &str, params: &ToolParams, out:
                 _ => "1280x720",
             };
             let mode = if params.visualizer_bars { "p2p" } else { "cline" };
+            let bg = params.bg_color;
+            let fc = if bg[0] > 8 || bg[1] > 8 || bg[2] > 8 {
+                format!(
+                    "color=c=0x{:02x}{:02x}{:02x}:s={sz}[bg];[0:a]showwaves=s={sz}:mode={mode}:colors=0xff5200[fg];[bg][fg]overlay=format=auto,format=yuv420p[v]",
+                    bg[0], bg[1], bg[2]
+                )
+            } else {
+                format!("[0:a]showwaves=s={sz}:mode={mode}:colors=0xff5200,format=yuv420p[v]")
+            };
             a.extend(s(&[
                 "-filter_complex",
-                &format!("[0:a]showwaves=s={sz}:mode={mode}:colors=0xff5200,format=yuv420p[v]"),
+                &fc,
                 "-map",
                 "[v]",
                 "-map",
@@ -178,7 +204,21 @@ pub fn build_ffmpeg_args(inputs: &[PathBuf], op: &str, params: &ToolParams, out:
         }
         "redactAudio" => {
             let end = params.end_sec.map(|e| e.to_string()).unwrap_or_else(|| "9999999".into());
-            a.extend(s(&["-af", &format!("volume=enable='between(t,{},{end})':volume=0", params.start_sec)]));
+            let start = params.start_sec;
+            if params.bleep_tone {
+                let dur = (params.end_sec.unwrap_or(start + 1.0) - start).max(0.1);
+                let delay_ms = (start * 1000.0).round() as u32;
+                a.extend(s(&[
+                    "-filter_complex",
+                    &format!(
+                        "[0:a]volume=enable='between(t,{start},{end})':volume=0[m];sine=f=1000:d={dur:.2},volume=0.35,adelay={delay_ms}|{delay_ms}[b];[m][b]amix=inputs=2:duration=first[a]"
+                    ),
+                    "-map",
+                    "[a]",
+                ]));
+            } else {
+                a.extend(s(&["-af", &format!("volume=enable='between(t,{start},{end})':volume=0")]));
+            }
         }
         "joinVideos" => {
             let n = ordered.len();
@@ -317,6 +357,66 @@ pub fn extract_video_filmstrip(path: &Path, duration: f32, count: usize, tile_w:
         }
     }
     tiles
+}
+
+/// Plays an audio or video preview snippet asynchronously via PowerShell SoundPlayer or default media handler.
+pub fn preview_media_range(path: &Path, start_sec: f32, end_sec: f32, bleep_tone: bool) {
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        let tmp = std::env::temp_dir().join("clementine_preview.wav");
+        let dur = (end_sec - start_sec).clamp(0.4, 8.0);
+        let mut cmd = Command::new(find_ffmpeg());
+        if bleep_tone {
+            cmd.args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=1000:duration=0.45",
+                "-af",
+                "volume=0.35",
+            ])
+            .arg(&tmp);
+        } else {
+            cmd.args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                &format!("{:.2}", start_sec.max(0.0)),
+                "-t",
+                &format!("{dur:.2}"),
+                "-i",
+            ])
+            .arg(&path)
+            .args(["-vn", "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2"])
+            .arg(&tmp);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+        let _ = cmd.status();
+        if tmp.is_file() {
+            let ps = format!(
+                "(New-Object Media.SoundPlayer '{}').PlaySync()",
+                tmp.display().to_string().replace('\'', "''")
+            );
+            let mut pcmd = Command::new("powershell.exe");
+            pcmd.args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &ps]);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                pcmd.creation_flags(0x08000000);
+            }
+            let _ = pcmd.status();
+        }
+    });
 }
 
 fn run(args: &[String]) -> Result<()> {

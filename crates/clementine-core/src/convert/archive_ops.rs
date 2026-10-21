@@ -66,9 +66,49 @@ fn read_entries(path: &Path, ext: &str) -> Result<Vec<Entry>> {
                 entries.push(Entry { path: p, data, is_dir: t.is_dir() });
             }
         }
+        "rar" => {
+            let tmp = tempfile::tempdir().map_err(ae)?;
+            extract_via_system_tar(path, tmp.path())?;
+            collect_dir_entries(tmp.path(), tmp.path(), &mut entries)?;
+        }
         other => return Err(ae(format!("cannot read .{other}"))),
     }
     Ok(entries)
+}
+
+fn collect_dir_entries(root: &Path, cur: &Path, out: &mut Vec<Entry>) -> Result<()> {
+    for ent in fs::read_dir(cur)? {
+        let ent = ent?;
+        let p = ent.path();
+        let rel = p
+            .strip_prefix(root)
+            .map_err(ae)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        if p.is_dir() {
+            out.push(Entry { path: format!("{rel}/"), data: Vec::new(), is_dir: true });
+            collect_dir_entries(root, &p, out)?;
+        } else {
+            out.push(Entry { path: rel, data: fs::read(&p)?, is_dir: false });
+        }
+    }
+    Ok(())
+}
+
+fn extract_via_system_tar(archive: &Path, dest: &Path) -> Result<()> {
+    let mut cmd = std::process::Command::new("tar.exe");
+    cmd.arg("-xf").arg(archive).arg("-C").arg(dest);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let out = cmd.output().map_err(ae)?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(ae(String::from_utf8_lossy(&out.stderr).trim().to_string()))
+    }
 }
 
 fn write_tar<W: Write>(w: W, entries: &[Entry]) -> Result<W> {
@@ -128,6 +168,9 @@ pub fn convert(path: &Path, src: &str, target: &str, out: &Path) -> Result<()> {
 
 /// Unpacks into the already-created folder `out`.
 pub fn extract(path: &Path, ext: &str, out: &Path) -> Result<()> {
+    if ext == "rar" {
+        return extract_via_system_tar(path, out);
+    }
     for e in read_entries(path, ext)? {
         let rel = safe_rel(&e.path)
             .ok_or_else(|| ae(format!("unsafe path in archive: {}", e.path)))?;

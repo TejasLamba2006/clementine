@@ -2,11 +2,12 @@
 use crate::renderer::{blit_mask_sized, fit_mask, rounded_box_sdf, seg_dist, Dib, Px};
 use clementine_core::convert::doc_ops::extract_text_ocr_from_file;
 use clementine_core::convert::image_ops::{
-    apply_frame_bg, apply_photo_edits, apply_upscale_sharpen, onnx_bg_model_path,
-    remove_background_local,
+    apply_frame_bg, apply_photo_edits, apply_upscale_sharpen, detect_faces_and_text_boxes,
+    onnx_bg_model_path, remove_background_local,
 };
 use clementine_core::convert::media_ops::{
-    extract_video_filmstrip, extract_video_frame_rgba, is_video_ext, probe_duration_secs,
+    extract_video_filmstrip, extract_video_frame_rgba, is_video_ext, preview_media_range,
+    probe_duration_secs,
 };
 use clementine_core::{tool_meta, ToolParams};
 use image::{imageops, Rgba, RgbaImage};
@@ -53,6 +54,11 @@ struct ModalState {
     thumb: RgbaImage,
     filmstrip: Vec<RgbaImage>,
     ocr_lines: Vec<String>,
+    detected_boxes: Vec<(u32, u32, u32, u32)>,
+    pdf_pages: Vec<usize>,
+    pdf_rotations: Vec<u16>,
+    meta_fields: [String; 3],
+    active_meta_field: Option<usize>,
     sliders: Vec<Slider>,
     pills: Vec<&'static str>,
     active_pill: usize,
@@ -259,7 +265,7 @@ fn default_controls(tool_id: &str, duration: f32) -> (Vec<Slider>, Vec<&'static 
                 s("Box Width", 15.0, 85.0, 48.0, false, "%"),
                 s("Box Height", 15.0, 75.0, 34.0, false, "%"),
             ],
-            vec!["Blur", "Solid Black"],
+            vec!["Blur", "Solid Black", "Auto Faces", "Auto Text", "Faces + Text"],
         ),
         "redactVideo" => (
             vec![
@@ -300,10 +306,10 @@ fn default_controls(tool_id: &str, duration: f32) -> (Vec<Slider>, Vec<&'static 
         ),
         "redactAudio" => (
             vec![
-                s("Mute Start", 0.0, (dur - 0.2).max(0.5), dur * 0.25, false, " s"),
-                s("Mute End", 0.2, dur, dur * 0.65, false, " s"),
+                s("Bleep Start", 0.0, (dur - 0.2).max(0.5), dur * 0.25, false, " s"),
+                s("Bleep End", 0.2, dur, dur * 0.65, false, " s"),
             ],
-            vec!["Mute Selected Range", "Mute First 25%"],
+            vec!["1 kHz Censor Beep", "Silent Mute", "First 25% Beep"],
         ),
         "splitVideo" => (
             vec![s("Split Point", 0.2, (dur - 0.2).max(0.5), dur * 0.5, false, " s")],
@@ -337,13 +343,17 @@ fn default_controls(tool_id: &str, duration: f32) -> (Vec<Slider>, Vec<&'static 
             vec!["16:9 Wave", "9:16 Wave", "1:1 Wave", "16:9 Bars", "9:16 Bars"],
         ),
         "joinVideos" => (vec![], vec!["Keep Order", "Reverse Order"]),
-        "organizePDF" | "mergePDF" => (
+        "organizePDF" => (
             vec![],
-            vec!["Reverse Order", "Keep Order", "First Page"],
+            vec!["Rotate 90°", "Reverse Order", "Duplicate 1st", "Remove Last"],
+        ),
+        "mergePDF" => (
+            vec![],
+            vec!["Keep Order", "Reverse Order", "First File Only"],
         ),
         _ => (
             vec![],
-            vec!["Remove All Tags", "Keep Color Profile"],
+            vec!["Strip All Tags", "Keep Color Profile", "Save Custom Tags"],
         ),
     }
 }
@@ -371,6 +381,11 @@ impl ModalState {
         } else {
             Vec::new()
         };
+        let stem = paths
+            .first()
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Untitled Document".into());
         Self {
             tool_id: tool_id.to_string(),
             title,
@@ -380,6 +395,11 @@ impl ModalState {
             thumb,
             filmstrip,
             ocr_lines,
+            detected_boxes: Vec::new(),
+            pdf_pages: vec![0, 1, 2],
+            pdf_rotations: vec![0, 0, 0],
+            meta_fields: [stem, "Clementine Local".into(), "Processed 100% Offline".into()],
+            active_meta_field: None,
             sliders,
             pills,
             active_pill,
@@ -441,9 +461,52 @@ impl ModalState {
                 self.sliders[0].val = s0;
                 self.sliders[1].val = s1;
             }
-            "redactAudio" if self.sliders.len() >= 2 && pill_idx == 1 => {
+            "redactAudio" if self.sliders.len() >= 2 && pill_idx == 2 => {
                 self.sliders[0].val = 0.0;
                 self.sliders[1].val = (dur * 0.25).max(0.2);
+            }
+            "redactImage" => {
+                if pill_idx >= 2 {
+                    let mode = (pill_idx - 1) as u8; // 1 = Faces, 2 = Text, 3 = Faces+Text
+                    if let Some(p) = self.paths.first() {
+                        self.detected_boxes = detect_faces_and_text_boxes(p, mode);
+                    }
+                    if self.detected_boxes.is_empty() {
+                        let (w, h) = self.source_dims;
+                        self.detected_boxes = vec![
+                            (w / 5, h / 5, w / 4, h / 5),
+                            (w / 2, h / 2, w / 3, h / 6),
+                        ];
+                    }
+                } else {
+                    self.detected_boxes.clear();
+                }
+            }
+            "organizePDF" => {
+                match pill_idx {
+                    0 => {
+                        for r in &mut self.pdf_rotations {
+                            *r = (*r + 90) % 360;
+                        }
+                    }
+                    1 => {
+                        self.pdf_pages.reverse();
+                        self.pdf_rotations.reverse();
+                    }
+                    2 => {
+                        if let Some(&first) = self.pdf_pages.first() {
+                            self.pdf_pages.push(first);
+                            self.pdf_rotations.push(0);
+                        }
+                    }
+                    3 => {
+                        if self.pdf_pages.len() > 1 {
+                            self.pdf_pages.pop();
+                            self.pdf_rotations.pop();
+                        }
+                    }
+                    _ => {}
+                }
             }
             "createCollage" if !self.sliders.is_empty() => {
                 self.sliders[0].val = match pill_idx {
@@ -522,6 +585,9 @@ impl ModalState {
             }
             "redactImage" => {
                 p.redact_solid = self.active_pill == 1;
+                if !self.detected_boxes.is_empty() {
+                    p.redact_rects = self.detected_boxes.clone();
+                }
                 let (w, h) = self.source_dims;
                 let rw = ((w as f32 * val(0, 48.0) / 100.0).round() as u32).max(8);
                 let rh = ((h as f32 * val(1, 34.0) / 100.0).round() as u32).max(8);
@@ -565,9 +631,14 @@ impl ModalState {
                 p.collage_cols = val(0, 2.0).round().clamp(1.0, 4.0) as u32;
                 p.corner_radius = val(1, 18.0).round() as u32;
             }
-            "trimVideo" | "redactAudio" => {
+            "trimVideo" => {
                 p.start_sec = val(0, 0.0);
                 p.end_sec = Some(val(1, dur).max(p.start_sec + 0.1));
+            }
+            "redactAudio" => {
+                p.start_sec = val(0, 0.0);
+                p.end_sec = Some(val(1, dur).max(p.start_sec + 0.1));
+                p.bleep_tone = self.active_pill != 1;
             }
             "trimAudio" => {
                 p.start_sec = val(0, 0.0);
@@ -613,6 +684,11 @@ impl ModalState {
                     _ => 0,
                 };
                 p.visualizer_bars = self.active_pill >= 3;
+                p.bg_color = if self.active_swatch == 0 {
+                    [0, 0, 0, 255]
+                } else {
+                    SWATCHES[self.active_swatch % SWATCHES.len()]
+                };
             }
             "joinVideos" => {
                 let n = self.paths.len().max(2);
@@ -622,13 +698,26 @@ impl ModalState {
                     (0..n).collect()
                 };
             }
-            "organizePDF" | "mergePDF" => {
-                let n = self.paths.len().max(3);
+            "organizePDF" => {
+                p.page_order = self.pdf_pages.clone();
+                p.page_rotations = self.pdf_rotations.clone();
+            }
+            "mergePDF" => {
+                let n = self.paths.len().max(2);
                 p.page_order = match self.active_pill {
-                    1 => (0..n).collect(),
+                    1 => (0..n).rev().collect(),
                     2 => vec![0],
-                    _ => vec![],
+                    _ => (0..n).collect(),
                 };
+            }
+            "removeMetadata" => {
+                if self.active_pill == 2 || self.active_meta_field.is_some() {
+                    p.custom_metadata = Some((
+                        self.meta_fields[0].clone(),
+                        self.meta_fields[1].clone(),
+                        self.meta_fields[2].clone(),
+                    ));
+                }
             }
             _ => {}
         }
@@ -861,7 +950,13 @@ fn render_modal(st: &ModalState) -> Vec<u32> {
                 2 => (88.0, 88.0),
                 _ => (162.0, 88.0),
             };
-            fill_rrect(&mut buf, 230.0, 152.0, cw, ch, 12.0, c8(16, 14, 13), 0.96);
+            let bg_col = if st.active_swatch == 0 {
+                c8(16, 14, 13)
+            } else {
+                let sw = SWATCHES[st.active_swatch % SWATCHES.len()];
+                c8(sw[0], sw[1], sw[2])
+            };
+            fill_rrect(&mut buf, 230.0, 152.0, cw, ch, 12.0, bg_col, 0.96);
             stroke_rrect(&mut buf, 230.0, 152.0, cw, ch, 12.0, 1.5, orange, 0.65);
             let scale = (st.sliders.first().map(|s| s.val).unwrap_or(85.0) / 100.0) as f64;
             let bars = 24;
@@ -895,38 +990,61 @@ fn render_modal(st: &ModalState) -> Vec<u32> {
             }
         }
         "removeMetadata" => {
-            fill_rrect(&mut buf, 230.0, 158.0, 202.0, 94.0, 14.0, [1.0; 3], 0.78);
-            let rows = [
-                ("Exif Image Dimensions", "1600 x 1200 px"),
-                ("Color Space Profile", "sRGB IEC61966-2.1"),
-                ("Camera Make & Lens", "Stripped on Save"),
-                ("GPS Latitude / Longitude", "Stripped on Save"),
-                ("IPTC / XMP Digest", "Stripped on Save"),
-            ];
-            for (i, (k, v)) in rows.iter().enumerate() {
-                let ry = 84.0 + i as f64 * 34.0;
-                if i > 0 {
-                    fill_rrect(&mut buf, 230.0, ry - 16.0, 184.0, 0.5, 0.0, c8(120, 110, 100), 0.16);
-                }
-                blit_mask_sized(&mut buf, TW, TH, &fit_mask(k, 11, 600, 180), 130.0, ry, c8(42, 36, 32));
-                blit_mask_sized(&mut buf, TW, TH, &fit_mask(v, 11, 500, 160), 336.0, ry, orange);
+            fill_rrect(&mut buf, 230.0, 158.0, 202.0, 94.0, 14.0, [1.0; 3], 0.84);
+            let labels = ["Title / Document", "Author / Artist", "Comment / Copyright"];
+            for (i, k) in labels.iter().enumerate() {
+                let ry = 88.0 + i as f64 * 42.0;
+                let active = st.active_meta_field == Some(i);
+                fill_rrect(&mut buf, 294.0, ry, 118.0, 14.0, 7.0, if active { c8(255, 240, 228) } else { c8(245, 242, 238) }, 0.95);
+                stroke_rrect(&mut buf, 294.0, ry, 118.0, 14.0, 7.0, if active { 1.8 } else { 1.0 }, if active { orange } else { c8(190, 180, 170) }, 0.85);
+                blit_mask_sized(&mut buf, TW, TH, &fit_mask(k, 11, 600, 116), 106.0, ry, c8(42, 36, 32));
+                let val_str = if st.active_pill == 0 && st.active_meta_field.is_none() {
+                    "Stripped on Save (Click to edit)".to_string()
+                } else {
+                    st.meta_fields[i].clone()
+                };
+                blit_mask_sized(&mut buf, TW, TH, &fit_mask(&val_str, 11, 600, 220), 294.0, ry, if active || st.active_pill == 2 { c8(32, 26, 22) } else { orange });
             }
+            blit_mask_sized(
+                &mut buf,
+                TW,
+                TH,
+                &fit_mask("GPS Latitude/Longitude, Camera Serial & XMP Tracking: Always Stripped", 10, 600, 380),
+                230.0,
+                222.0,
+                c8(96, 72, 54),
+            );
         }
         "organizePDF" | "mergePDF" => {
             fill_rrect(&mut buf, 230.0, 158.0, 202.0, 94.0, 14.0, c8(255, 245, 235), 0.55);
-            let order: &[usize] = match st.active_pill {
-                1 => &[1, 2, 3],
-                2 => &[1],
-                _ => &[3, 2, 1],
+            let pages: Vec<usize> = if st.tool_id == "organizePDF" {
+                st.pdf_pages.iter().map(|&p| p + 1).collect()
+            } else if st.active_pill == 1 {
+                vec![3, 2, 1]
+            } else if st.active_pill == 2 {
+                vec![1]
+            } else {
+                vec![1, 2, 3]
             };
-            for (i, pg) in order.iter().enumerate() {
-                let px = 114.0 + i as f64 * 116.0;
-                fill_rrect(&mut buf, px, 158.0, 44.0, 62.0, 8.0, [1.0; 3], 0.95);
-                fill_disc(&mut buf, px - 24.0, 114.0, 11.0, orange, 1.0);
-                blit_mask_sized(&mut buf, TW, TH, &fit_mask(&pg.to_string(), 11, 700, 24), px - 24.0, 114.0, [1.0; 3]);
-                for ln in 0..4 {
-                    fill_rrect(&mut buf, px, 142.0 + ln as f64 * 12.0, 28.0, 1.5, 1.0, c8(190, 185, 180), 0.8);
+            let n = pages.len().min(4).max(1);
+            let step = 340.0 / n as f64;
+            let start_x = 230.0 - step * (n as f64 - 1.0) * 0.5;
+            for (i, pg) in pages.iter().take(4).enumerate() {
+                let px = start_x + i as f64 * step;
+                let rot = st.pdf_rotations.get(i).copied().unwrap_or(0);
+                let (pw_card, ph_card) = if rot % 180 == 90 { (58.0, 42.0) } else { (42.0, 58.0) };
+                fill_rrect(&mut buf, px, 154.0, pw_card, ph_card, 8.0, [1.0; 3], 0.96);
+                fill_disc(&mut buf, px - 22.0, 114.0, 11.0, orange, 1.0);
+                blit_mask_sized(&mut buf, TW, TH, &fit_mask(&pg.to_string(), 11, 700, 24), px - 22.0, 114.0, [1.0; 3]);
+                if rot != 0 {
+                    blit_mask_sized(&mut buf, TW, TH, &fit_mask(&format!("{rot}°"), 10, 700, 36), px + 18.0, 114.0, orange);
                 }
+                for ln in 0..4 {
+                    fill_rrect(&mut buf, px, 140.0 + ln as f64 * 11.0, pw_card - 14.0, 1.5, 1.0, c8(190, 185, 180), 0.8);
+                }
+            }
+            if st.tool_id == "organizePDF" {
+                blit_mask_sized(&mut buf, TW, TH, &fit_mask("Click a page card to rotate 90°, or use pills below", 10, 600, 340), 230.0, 234.0, c8(86, 62, 44));
             }
         }
         "frameImage" => {
@@ -1044,13 +1162,25 @@ fn render_modal(st: &ModalState) -> Vec<u32> {
                     fill_rrect(&mut buf, bcx + dx, bcy + dy, 4.5, 4.5, 2.0, orange, 1.0);
                 }
             } else if st.tool_id == "redactImage" || st.tool_id == "redactVideo" {
-                let rw = pw * (st.sliders.first().map(|s| s.val).unwrap_or(48.0) as f64 / 100.0) * 0.5;
-                let rh = ph * (st.sliders.get(1).map(|s| s.val).unwrap_or(34.0) as f64 / 100.0) * 0.5;
-                let bcx = (ox as f64 + pw * st.box_center.0 as f64).clamp(ox as f64 + rw, ox as f64 + pw - rw);
-                let bcy = (oy as f64 + ph * st.box_center.1 as f64).clamp(oy as f64 + rh, oy as f64 + ph - rh);
                 let col = if st.active_pill == 1 { c8(8, 8, 8) } else { c8(90, 110, 120) };
-                fill_rrect(&mut buf, bcx, bcy, rw, rh, 4.0, col, 0.94);
-                stroke_rrect(&mut buf, bcx, bcy, rw, rh, 4.0, 2.2, orange, 1.0);
+                if !st.detected_boxes.is_empty() {
+                    let (sw, sh) = (st.source_dims.0.max(1) as f64, st.source_dims.1.max(1) as f64);
+                    for &(bx, by, bw, bh) in &st.detected_boxes {
+                        let rcx = ox as f64 + ((bx as f64 + bw as f64 * 0.5) / sw) * pw;
+                        let rcy = oy as f64 + ((by as f64 + bh as f64 * 0.5) / sh) * ph;
+                        let rhw = ((bw as f64 / sw) * pw * 0.5).max(8.0);
+                        let rhh = ((bh as f64 / sh) * ph * 0.5).max(6.0);
+                        fill_rrect(&mut buf, rcx, rcy, rhw, rhh, 3.0, col, 0.94);
+                        stroke_rrect(&mut buf, rcx, rcy, rhw, rhh, 3.0, 1.8, orange, 1.0);
+                    }
+                } else {
+                    let rw = pw * (st.sliders.first().map(|s| s.val).unwrap_or(48.0) as f64 / 100.0) * 0.5;
+                    let rh = ph * (st.sliders.get(1).map(|s| s.val).unwrap_or(34.0) as f64 / 100.0) * 0.5;
+                    let bcx = (ox as f64 + pw * st.box_center.0 as f64).clamp(ox as f64 + rw, ox as f64 + pw - rw);
+                    let bcy = (oy as f64 + ph * st.box_center.1 as f64).clamp(oy as f64 + rh, oy as f64 + ph - rh);
+                    fill_rrect(&mut buf, bcx, bcy, rw, rh, 4.0, col, 0.94);
+                    stroke_rrect(&mut buf, bcx, bcy, rw, rh, 4.0, 2.2, orange, 1.0);
+                }
             } else if st.tool_id == "annotateImage" {
                 let scale = st.sliders.first().map(|s| s.val).unwrap_or(54.0) as f64 / 100.0;
                 let aw = pw * scale * 0.5;
@@ -1070,13 +1200,18 @@ fn render_modal(st: &ModalState) -> Vec<u32> {
         }
     }
 
-    // 4. Swatches row for Add BG (`frameImage`)
+    // 4. Swatches row for Add BG (`frameImage`) and Audio Visualizer (`audioToVideo`)
     let mut y_cursor = 282.0;
-    if st.tool_id == "frameImage" {
+    if st.tool_id == "frameImage" || st.tool_id == "audioToVideo" {
         blit_mask_sized(&mut buf, TW, TH, &fit_mask("Background", 12, 600, 90), 66.0, y_cursor, c8(68, 44, 28));
         for (i, sw) in SWATCHES.iter().enumerate() {
             let sx = 142.0 + i as f64 * 38.0;
-            fill_rrect(&mut buf, sx, y_cursor, 15.0, 12.0, 6.0, c8(sw[0], sw[1], sw[2]), 1.0);
+            let col = if st.tool_id == "audioToVideo" && i == 0 {
+                c8(16, 14, 13)
+            } else {
+                c8(sw[0], sw[1], sw[2])
+            };
+            fill_rrect(&mut buf, sx, y_cursor, 15.0, 12.0, 6.0, col, 1.0);
             if i == st.active_swatch {
                 stroke_rrect(&mut buf, sx, y_cursor, 16.5, 13.5, 7.0, 2.2, orange, 1.0);
             }
@@ -1128,10 +1263,19 @@ fn render_modal(st: &ModalState) -> Vec<u32> {
         }
     }
 
-    // 7. Bottom Footer Bar (`Reset` + `#FF5200 Apply`)
+    // 7. Bottom Footer Bar (`Reset` + optional `Preview` + `#FF5200 Apply`)
     fill_rrect(&mut buf, TW as f64 * 0.5, 484.0, TW as f64 * 0.5 - 16.0, 0.5, 0.0, c8(60, 40, 20), 0.12);
     fill_rrect(&mut buf, 64.0, 510.0, 38.0, 15.0, 8.0, c8(90, 64, 48), 0.16);
     blit_mask_sized(&mut buf, TW, TH, &fit_mask("Reset", 12, 600, 64), 64.0, 510.0, c8(58, 42, 30));
+
+    if matches!(
+        st.tool_id.as_str(),
+        "trimAudio" | "redactAudio" | "normalizeAudio" | "audioChannels" | "trimVideo"
+    ) {
+        fill_rrect(&mut buf, 212.0, 510.0, 54.0, 15.0, 8.0, c8(90, 64, 48), 0.22);
+        stroke_rrect(&mut buf, 212.0, 510.0, 54.0, 15.0, 8.0, 1.0, orange, 0.65);
+        blit_mask_sized(&mut buf, TW, TH, &fit_mask("Preview Audio", 11, 700, 96), 212.0, 510.0, c8(58, 42, 30));
+    }
 
     fill_rrect(&mut buf, 376.0, 510.0, 58.0, 16.0, 9.0, orange, 0.96);
     blit_mask_sized(&mut buf, TW, TH, &fit_mask("Apply", 13, 700, 96), 376.0, 510.0, [1.0; 3]);
@@ -1232,17 +1376,55 @@ unsafe extern "system" fn modal_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM)
                 present_modal(hwnd);
                 return 0;
             }
+            // 3b. Preview Audio button (158..266, 494..526)
+            if (158..=266).contains(&mx) && (494..=526).contains(&my) {
+                MODAL.with(|c| {
+                    if let Some(st) = c.borrow().as_ref() {
+                        if matches!(
+                            st.tool_id.as_str(),
+                            "trimAudio" | "redactAudio" | "normalizeAudio" | "audioChannels" | "trimVideo"
+                        ) {
+                            let p = st.build_params();
+                            let path = st.paths.first().cloned().unwrap_or_default();
+                            preview_media_range(
+                                &path,
+                                p.start_sec,
+                                p.end_sec.unwrap_or(st.duration),
+                                st.tool_id == "redactAudio" && p.bleep_tone,
+                            );
+                        }
+                    }
+                });
+                return 0;
+            }
             // 4. Direct timeline scrubbing or canvas box dragging
             let mut changed = false;
             MODAL.with(|c| {
                 let mut g = c.borrow_mut();
                 let Some(st) = g.as_mut() else { return };
+                if st.tool_id == "removeMetadata" && (72..=190).contains(&my) && (170..=418).contains(&mx) {
+                    let idx = ((my - 72) / 42).clamp(0, 2) as usize;
+                    st.active_meta_field = Some(idx);
+                    st.active_pill = 2;
+                    changed = true;
+                    return;
+                }
+                if st.tool_id == "organizePDF" && (90..=218).contains(&my) && (56..=404).contains(&mx) {
+                    let n = st.pdf_pages.len().min(4).max(1);
+                    let idx = (((mx - 56) as usize * n) / 348).min(n - 1);
+                    if let Some(r) = st.pdf_rotations.get_mut(idx) {
+                        *r = (*r + 90) % 360;
+                        changed = true;
+                        return;
+                    }
+                }
                 if matches!(
                     st.tool_id.as_str(),
                     "cropImage" | "cropVideo" | "redactImage" | "redactVideo" | "annotateImage"
                 ) && (60..=254).contains(&my)
                     && (48..=412).contains(&mx)
                 {
+                    st.detected_boxes.clear();
                     st.dragging_canvas = true;
                     update_canvas_box_at(st, mx, my);
                     SetCapture(hwnd);
@@ -1262,7 +1444,7 @@ unsafe extern "system" fn modal_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM)
                     return;
                 }
                 let mut y_cur = 282;
-                if st.tool_id == "frameImage" {
+                if st.tool_id == "frameImage" || st.tool_id == "audioToVideo" {
                     if (y_cur - 14..=y_cur + 14).contains(&my) {
                         for i in 0..SWATCHES.len() {
                             let sx = 142 + i as i32 * 38;
@@ -1355,6 +1537,27 @@ unsafe extern "system" fn modal_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM)
         }
         WM_KEYDOWN if wp == VK_ESCAPE as usize => {
             DestroyWindow(hwnd);
+            0
+        }
+        WM_CHAR => {
+            let ch = (wp as u16) as u8 as char;
+            let updated = MODAL.with(|c| {
+                let mut g = c.borrow_mut();
+                let Some(st) = g.as_mut() else { return false };
+                let Some(idx) = st.active_meta_field else { return false };
+                if wp == 8 {
+                    st.meta_fields[idx].pop();
+                    true
+                } else if ch >= ' ' && ch <= '~' && st.meta_fields[idx].len() < 42 {
+                    st.meta_fields[idx].push(ch);
+                    true
+                } else {
+                    false
+                }
+            });
+            if updated {
+                present_modal(hwnd);
+            }
             0
         }
         WM_TIMER if wp == TIMER_AUTO_ID => {

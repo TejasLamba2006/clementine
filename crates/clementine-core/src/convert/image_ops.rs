@@ -686,40 +686,114 @@ pub fn apply_frame_bg(img: &RgbaImage, p: &ToolParams) -> RgbaImage {
     canvas
 }
 
+/// 100% local face & text bounding-box detector using Windows 10/11 built-in
+/// `Windows.Media.FaceAnalysis.FaceDetector` and `Windows.Media.Ocr.OcrEngine`.
+/// `mode`: `1 = Faces Only`, `2 = Text Only`, `3 = Faces + Text`.
+pub fn detect_faces_and_text_boxes(image_path: &Path, mode: u8) -> Vec<(u32, u32, u32, u32)> {
+    let abs = fs::canonicalize(image_path).unwrap_or_else(|_| image_path.to_path_buf());
+    let clean_path = abs
+        .display()
+        .to_string()
+        .trim_start_matches(r"\\?\")
+        .replace('\'', "''");
+    let do_faces = if mode == 1 || mode == 3 { "$true" } else { "$false" };
+    let do_text = if mode == 2 || mode == 3 { "$true" } else { "$false" };
+    let script = format!(
+        r#"Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {{ $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -like 'IAsyncOperation*' }})[0]
+function Await($WinRtTask, $ResultType) {{
+    $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
+    $netTask = $asTask.Invoke($null, @($WinRtTask))
+    $netTask.Wait(-1) | Out-Null
+    $netTask.Result
+}}
+[Windows.Storage.StorageFile,Windows.Storage,ContentType=WindowsRuntime] | Out-Null
+[Windows.Graphics.Imaging.BitmapDecoder,Windows.Graphics,ContentType=WindowsRuntime] | Out-Null
+[Windows.Graphics.Imaging.SoftwareBitmap,Windows.Graphics,ContentType=WindowsRuntime] | Out-Null
+[Windows.Media.FaceAnalysis.FaceDetector,Windows.Foundation.UniversalApiContract,ContentType=WindowsRuntime] | Out-Null
+[Windows.Media.Ocr.OcrEngine,Windows.Foundation.UniversalApiContract,ContentType=WindowsRuntime] | Out-Null
+$file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync('{clean_path}')) ([Windows.Storage.StorageFile])
+$stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+$decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+$bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+if ({do_faces}) {{
+    $det = Await ([Windows.Media.FaceAnalysis.FaceDetector]::CreateAsync()) ([Windows.Media.FaceAnalysis.FaceDetector])
+    $gray = [Windows.Graphics.Imaging.SoftwareBitmap]::Convert($bitmap, [Windows.Graphics.Imaging.BitmapPixelFormat]::Gray8)
+    $faces = Await ($det.DetectFacesAsync($gray)) ([System.Collections.Generic.IList[Windows.Media.FaceAnalysis.DetectedFace]])
+    foreach ($f in $faces) {{
+        $b = $f.FaceBox
+        Write-Output "$($b.X),$($b.Y),$($b.Width),$($b.Height)"
+    }}
+}}
+if ({do_text}) {{
+    $eng = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+    $ocr = Await ($eng.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+    foreach ($l in $ocr.Lines) {{
+        foreach ($w in $l.Words) {{
+            $r = $w.BoundingRect
+            Write-Output "$([int]$r.X),$([int]$r.Y),$([int]$r.Width),$([int]$r.Height)"
+        }}
+    }}
+}}"#
+    );
+    let mut cmd = std::process::Command::new("powershell.exe");
+    cmd.args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let Ok(out) = cmd.output() else { return Vec::new() };
+    let mut boxes = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let parts: Vec<u32> = line.trim().split(',').filter_map(|s| s.parse().ok()).collect();
+        if parts.len() == 4 && parts[2] >= 4 && parts[3] >= 4 {
+            boxes.push((parts[0], parts[1], parts[2], parts[3]));
+        }
+    }
+    boxes
+}
+
 fn redact(img: &DynamicImage, p: &ToolParams) -> Result<DynamicImage> {
     const BLOCK: u32 = 16;
     let (iw, ih) = (img.width(), img.height());
-    let (rx, ry, rw, rh) = p.crop_rect.unwrap_or((iw / 4, ih / 4, iw / 2, ih / 2));
-    let (rx, ry) = (rx.min(iw), ry.min(ih));
-    let (rw, rh) = (rw.min(iw - rx), rh.min(ih - ry));
-    if rw == 0 || rh == 0 {
-        return Err(ClementineError::InvalidInput("empty redact area".into()));
-    }
+    let rects: Vec<(u32, u32, u32, u32)> = if !p.redact_rects.is_empty() {
+        p.redact_rects.clone()
+    } else {
+        vec![p.crop_rect.unwrap_or((iw / 4, ih / 4, iw / 2, ih / 2))]
+    };
     let mut out = img.to_rgba8();
-    if p.redact_solid {
-        for y in ry..ry + rh {
-            for x in rx..rx + rw {
-                out.put_pixel(x, y, Rgba([0, 0, 0, 255]));
-            }
+    for (rx, ry, rw, rh) in rects {
+        let (rx, ry) = (rx.min(iw), ry.min(ih));
+        let (rw, rh) = (rw.min(iw - rx), rh.min(ih - ry));
+        if rw == 0 || rh == 0 {
+            continue;
         }
-        return Ok(DynamicImage::ImageRgba8(out));
-    }
-    for by in (ry..ry + rh).step_by(BLOCK as usize) {
-        for bx in (rx..rx + rw).step_by(BLOCK as usize) {
-            let (bw, bh) = (BLOCK.min(rx + rw - bx), BLOCK.min(ry + rh - by));
-            let mut sum = [0u32; 4];
-            for y in by..by + bh {
-                for x in bx..bx + bw {
-                    for (s, c) in sum.iter_mut().zip(out.get_pixel(x, y).0) {
-                        *s += c as u32;
-                    }
+        if p.redact_solid {
+            for y in ry..ry + rh {
+                for x in rx..rx + rw {
+                    out.put_pixel(x, y, Rgba([0, 0, 0, 255]));
                 }
             }
-            let n = bw * bh;
-            let avg = Rgba([0, 1, 2, 3].map(|i| (sum[i] / n) as u8));
-            for y in by..by + bh {
-                for x in bx..bx + bw {
-                    out.put_pixel(x, y, avg);
+        } else {
+            for by in (ry..ry + rh).step_by(BLOCK as usize) {
+                for bx in (rx..rx + rw).step_by(BLOCK as usize) {
+                    let (bw, bh) = (BLOCK.min(rx + rw - bx), BLOCK.min(ry + rh - by));
+                    let mut sum = [0u32; 4];
+                    for y in by..by + bh {
+                        for x in bx..bx + bw {
+                            for (s, c) in sum.iter_mut().zip(out.get_pixel(x, y).0) {
+                                *s += c as u32;
+                            }
+                        }
+                    }
+                    let n = bw * bh;
+                    let avg = Rgba([0, 1, 2, 3].map(|i| (sum[i] / n) as u8));
+                    for y in by..by + bh {
+                        for x in bx..bx + bw {
+                            out.put_pixel(x, y, avg);
+                        }
+                    }
                 }
             }
         }

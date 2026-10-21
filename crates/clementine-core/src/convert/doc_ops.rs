@@ -879,6 +879,11 @@ pub fn merge_pdf(srcs: &[std::path::PathBuf], out: &Path) -> Result<()> {
 
 /// Reorders/filters pages by 0-based `order`; empty reverses the page order.
 pub fn organize_pdf(src: &Path, order: &[usize], out: &Path) -> Result<()> {
+    organize_pdf_with_rotations(src, order, &[], out)
+}
+
+/// Reorders/filters pages by `order` and applies per-page `/Rotate` angles (`0`, `90`, `180`, `270`).
+pub fn organize_pdf_with_rotations(src: &Path, order: &[usize], rotations: &[u16], out: &Path) -> Result<()> {
     let pages = pdf_pages(&fs::read(src)?)?;
     let order: Vec<usize> =
         if order.is_empty() { (0..pages.len()).rev().collect() } else { order.to_vec() };
@@ -889,14 +894,48 @@ pub fn organize_pdf(src: &Path, order: &[usize], out: &Path) -> Result<()> {
         })?;
         picked.push(PdfPage { w: p.w, h: p.h, content: p.content.clone(), jpeg: p.jpeg.clone() });
     }
-    fs::write(out, build_pdf(&picked))?;
+    let mut bytes = build_pdf(&picked);
+    if rotations.iter().any(|&r| r % 360 != 0) {
+        let mut s = String::from_utf8_lossy(&bytes).into_owned();
+        for (idx, &rot) in rotations.iter().enumerate() {
+            let r = rot % 360;
+            if r != 0 {
+                let needle = format!("/Type /Page /Parent 2 0 R /MediaBox");
+                if let Some(pos) = s.match_indices(&needle).nth(idx).map(|(p, _)| p) {
+                    s.insert_str(pos + "/Type /Page".len(), &format!(" /Rotate {r}"));
+                }
+            }
+        }
+        bytes = s.into_bytes();
+    }
+    fs::write(out, bytes)?;
+    Ok(())
+}
+
+/// Re-serializes pages into a clean PDF or writes custom `/Info` tags (`Title`, `Author`, `Subject`).
+pub fn clean_or_tag_pdf(src: &Path, meta: Option<&(String, String, String)>, out: &Path) -> Result<()> {
+    let mut bytes = build_pdf(&pdf_pages(&fs::read(src)?)?);
+    if let Some((title, author, comment)) = meta {
+        let info = format!(
+            "999 0 obj\n<< /Title ({}) /Author ({}) /Subject ({}) >>\nendobj\n",
+            String::from_utf8_lossy(&pdf_escape(title)),
+            String::from_utf8_lossy(&pdf_escape(author)),
+            String::from_utf8_lossy(&pdf_escape(comment))
+        );
+        let mut s = String::from_utf8_lossy(&bytes).into_owned();
+        if let Some(pos) = s.find("trailer\n<<") {
+            s.insert_str(pos, &info);
+            s = s.replacen("/Root 1 0 R", "/Root 1 0 R /Info 999 0 R", 1);
+            bytes = s.into_bytes();
+        }
+    }
+    fs::write(out, bytes)?;
     Ok(())
 }
 
 /// Re-serializes pages into a clean PDF (build_pdf writes no /Info dictionary).
 pub fn clean_pdf(src: &Path, out: &Path) -> Result<()> {
-    fs::write(out, build_pdf(&pdf_pages(&fs::read(src)?)?))?;
-    Ok(())
+    clean_or_tag_pdf(src, None, out)
 }
 
 // ------------------------------------------------------------------ XLSX
