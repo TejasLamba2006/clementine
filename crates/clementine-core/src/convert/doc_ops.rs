@@ -1,8 +1,10 @@
-use std::fs;
 use std::collections::HashMap;
+use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 
+use flate2::read::{DeflateDecoder, ZlibDecoder};
+use image::{DynamicImage, Rgba, RgbaImage};
 use pulldown_cmark::{html, Event, Parser, Tag, TagEnd};
 
 use super::{ClementineError, Result};
@@ -12,7 +14,7 @@ use super::{ClementineError, Result};
 pub struct PdfPage {
     pub w: f32,
     pub h: f32,
-    /// Page content stream.
+    /// Page content stream (uncompressed).
     pub content: Vec<u8>,
     /// Optional JPEG painted as `/Im0`: (bytes, pixel width, pixel height).
     pub jpeg: Option<(Vec<u8>, u32, u32)>,
@@ -29,7 +31,6 @@ pub fn build_pdf(pages: &[PdfPage]) -> Vec<u8> {
         out.extend_from_slice(body);
         out.extend_from_slice(b"\nendobj\n");
     };
-    // Object ids: 1 catalog, 2 page tree, 3 font, then per page 2-3 objects.
     let mut next_id = 4;
     let mut kids = String::new();
     let mut ids = Vec::new();
@@ -104,7 +105,7 @@ fn pdf_escape(s: &str) -> Vec<u8> {
 }
 
 /// Text to an A4 multi-page PDF, wrapping at 90 columns.
-fn text_pdf(text: &str) -> Vec<u8> {
+pub fn text_pdf(text: &str) -> Vec<u8> {
     const COLS: usize = 90;
     const LINES: usize = 50;
     let mut wrapped: Vec<String> = Vec::new();
@@ -136,7 +137,7 @@ fn text_pdf(text: &str) -> Vec<u8> {
     build_pdf(&pages)
 }
 
-// ------------------------------------------------------------------ DOCX
+// ------------------------------------------------------------------ DOCX / EPUB / PPTX / ODS
 
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
@@ -168,6 +169,247 @@ fn docx(text: &str) -> Result<Vec<u8>> {
         z.write_all(data.as_bytes())?;
     }
     Ok(z.finish().map_err(ze)?.into_inner())
+}
+
+fn docx_to_text(bytes: &[u8]) -> Result<String> {
+    let Ok(mut z) = zip::ZipArchive::new(Cursor::new(bytes)) else {
+        return Ok(String::from_utf8_lossy(bytes).into_owned());
+    };
+    let mut xml = String::new();
+    for candidate in ["word/document.xml", "index.xml", "QuickLook/Preview.txt"] {
+        if let Ok(mut f) = z.by_name(candidate) {
+            let _ = f.read_to_string(&mut xml);
+            if !xml.is_empty() {
+                break;
+            }
+        }
+    }
+    if xml.is_empty() {
+        return Err(ClementineError::InvalidInput("document archive has no readable text stream".into()));
+    }
+    let mut paragraphs = Vec::new();
+    for p in xml.split("<w:p") {
+        if !p.starts_with('>') && !p.starts_with(' ') {
+            continue;
+        }
+        let t = xml_texts_tag(p, "w:t");
+        paragraphs.push(t);
+    }
+    if paragraphs.is_empty() {
+        Ok(html_to_text(&xml, false))
+    } else {
+        Ok(paragraphs.join("\n").trim().to_string() + "\n")
+    }
+}
+
+fn epub(text: &str) -> Result<Vec<u8>> {
+    let body: String = text
+        .lines()
+        .map(|l| format!("<p>{}</p>\n", xml_escape(l)))
+        .collect();
+    let container = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><container version=\"1.0\" xmlns=\"urn:oasis:names:tc:opendocument:xmlns:container\"><rootfiles><rootfile full-path=\"OEBPS/content.opf\" media-type=\"application/oebps-package+xml\"/></rootfiles></container>";
+    let opf = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><package xmlns=\"http://www.idpf.org/2007/opf\" unique-identifier=\"BookId\" version=\"2.0\"><metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:title>Document</dc:title><dc:language>en</dc:language></metadata><manifest><item id=\"ch1\" href=\"chapter.xhtml\" media-type=\"application/xhtml+xml\"/></manifest><spine><itemref idref=\"ch1\"/></spine></package>";
+    let xhtml = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE html><html xmlns=\"http://www.w3.org/1999/xhtml\"><head><title>Document</title></head><body>\n{body}</body></html>");
+    let ze = |e: zip::result::ZipError| ClementineError::ArchiveError(e.to_string());
+    let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let stored = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let deflated = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    z.start_file("mimetype", stored).map_err(ze)?;
+    z.write_all(b"application/epub+zip")?;
+    for (name, data) in [
+        ("META-INF/container.xml", container),
+        ("OEBPS/content.opf", opf),
+        ("OEBPS/chapter.xhtml", xhtml.as_str()),
+    ] {
+        z.start_file(name, deflated).map_err(ze)?;
+        z.write_all(data.as_bytes())?;
+    }
+    Ok(z.finish().map_err(ze)?.into_inner())
+}
+
+fn epub_to_text(bytes: &[u8]) -> Result<String> {
+    let ze = |e: zip::result::ZipError| ClementineError::ArchiveError(e.to_string());
+    let mut z = zip::ZipArchive::new(Cursor::new(bytes)).map_err(ze)?;
+    let mut out = String::new();
+    for i in 0..z.len() {
+        let Ok(mut f) = z.by_index(i) else { continue };
+        let name = f.name().to_ascii_lowercase();
+        if name.ends_with(".xhtml") || name.ends_with(".html") || name.ends_with(".htm") {
+            let mut s = String::new();
+            if f.read_to_string(&mut s).is_ok() {
+                out.push_str(&html_to_text(&s, false));
+                out.push('\n');
+            }
+        }
+    }
+    Ok(out.trim().to_string() + "\n")
+}
+
+fn pptx(text: &str) -> Result<Vec<u8>> {
+    let runs: String = text
+        .lines()
+        .take(25)
+        .map(|l| format!("<a:p><a:r><a:t>{}</a:t></a:r></a:p>", xml_escape(l)))
+        .collect();
+    let types = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/ppt/presentation.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml\"/><Override PartName=\"/ppt/slides/slide1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.slide+xml\"/></Types>";
+    let rels = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"ppt/presentation.xml\"/></Relationships>";
+    let pres = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><p:presentation xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\"><p:sldIdLst><p:sldId id=\"256\" r:id=\"rId1\"/></p:sldIdLst></p:presentation>";
+    let prels = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide\" Target=\"slides/slide1.xml\"/></Relationships>";
+    let slide = format!("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><p:sld xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\"><p:cSld><p:spTree><p:sp><p:txBody>{runs}</p:txBody></p:sp></p:spTree></p:cSld></p:sld>");
+    let ze = |e: zip::result::ZipError| ClementineError::ArchiveError(e.to_string());
+    let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let o = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    for (name, data) in [
+        ("[Content_Types].xml", types),
+        ("_rels/.rels", rels),
+        ("ppt/presentation.xml", pres),
+        ("ppt/_rels/presentation.xml.rels", prels),
+        ("ppt/slides/slide1.xml", slide.as_str()),
+    ] {
+        z.start_file(name, o).map_err(ze)?;
+        z.write_all(data.as_bytes())?;
+    }
+    Ok(z.finish().map_err(ze)?.into_inner())
+}
+
+fn pptx_to_text(bytes: &[u8]) -> Result<String> {
+    let Ok(mut z) = zip::ZipArchive::new(Cursor::new(bytes)) else {
+        return Ok(String::from_utf8_lossy(bytes).into_owned());
+    };
+    let mut out = Vec::new();
+    for i in 0..z.len() {
+        let Ok(mut f) = z.by_index(i) else { continue };
+        let name = f.name().to_string();
+        if name.starts_with("ppt/slides/slide") && name.ends_with(".xml") {
+            let mut s = String::new();
+            if f.read_to_string(&mut s).is_ok() {
+                let mut slide_lines = Vec::new();
+                for p in s.split("<a:p") {
+                    let t = xml_texts_tag(p, "a:t");
+                    if !t.trim().is_empty() {
+                        slide_lines.push(t);
+                    }
+                }
+                if !slide_lines.is_empty() {
+                    out.push(slide_lines.join("\n"));
+                }
+            }
+        }
+    }
+    Ok(out.join("\n\n").trim().to_string() + "\n")
+}
+
+fn rtf_to_text(rtf: &str) -> String {
+    let mut out = String::new();
+    let chars: Vec<char> = rtf.chars().collect();
+    let mut i = 0;
+    let mut depth = 0i32;
+    let mut skip_depth = None;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '{' => {
+                depth += 1;
+                let rest: String = chars[i + 1..chars.len().min(i + 16)].iter().collect();
+                if skip_depth.is_none()
+                    && (rest.starts_with("\\fonttbl")
+                        || rest.starts_with("\\colortbl")
+                        || rest.starts_with("\\stylesheet")
+                        || rest.starts_with("\\info")
+                        || rest.starts_with("\\*"))
+                {
+                    skip_depth = Some(depth);
+                }
+                i += 1;
+            }
+            '}' => {
+                if skip_depth == Some(depth) {
+                    skip_depth = None;
+                }
+                depth -= 1;
+                i += 1;
+            }
+            '\\' => {
+                i += 1;
+                if i >= chars.len() {
+                    break;
+                }
+                if chars[i] == '\\' || chars[i] == '{' || chars[i] == '}' {
+                    if skip_depth.is_none() {
+                        out.push(chars[i]);
+                    }
+                    i += 1;
+                    continue;
+                }
+                let start = i;
+                while i < chars.len() && chars[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                let word: String = chars[start..i].iter().collect();
+                while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '-') {
+                    i += 1;
+                }
+                if i < chars.len() && chars[i] == ' ' {
+                    i += 1;
+                }
+                if skip_depth.is_none() {
+                    match word.as_str() {
+                        "par" | "line" => out.push('\n'),
+                        "tab" => out.push('\t'),
+                        _ => {}
+                    }
+                }
+            }
+            '\r' | '\n' => i += 1,
+            _ => {
+                if skip_depth.is_none() {
+                    out.push(c);
+                }
+                i += 1;
+            }
+        }
+    }
+    out.trim().to_string() + "\n"
+}
+
+fn render_text_page_image(text: &str) -> DynamicImage {
+    let (w, h) = (600u32, 840u32);
+    let mut img = RgbaImage::from_pixel(w, h, Rgba([255, 255, 255, 255]));
+    // Subtle page header & ruled text representation
+    for (idx, line) in text.lines().take(36).enumerate() {
+        let y0 = 42 + idx as u32 * 20;
+        let len_px = ((line.trim().len() as u32) * 7).clamp(0, w - 88);
+        for dy in 0..8 {
+            for dx in 0..len_px {
+                let shade = if idx == 0 { 28 } else { 68 };
+                img.put_pixel(44 + dx, y0 + dy, Rgba([shade, shade, shade + 6, 255]));
+            }
+        }
+    }
+    DynamicImage::ImageRgba8(img)
+}
+
+fn write_text_target(text: &str, src: &str, target: &str, out: &Path) -> Result<()> {
+    let unsupported = || ClementineError::UnsupportedConversion { from: src.into(), to: target.into() };
+    match target {
+        "txt" => fs::write(out, text.as_bytes())?,
+        "md" => fs::write(out, text.as_bytes())?,
+        "html" => fs::write(out, txt_to_html(text).as_bytes())?,
+        "pdf" => fs::write(out, text_pdf(text))?,
+        "docx" | "pages" => fs::write(out, docx(text)?)?,
+        "epub" => fs::write(out, epub(text)?)?,
+        "pptx" => fs::write(out, pptx(text)?)?,
+        "xlsx" => {
+            let rows: Vec<Vec<String>> = text.lines().map(|l| vec![l.to_string()]).collect();
+            fs::write(out, xlsx(&rows)?)?;
+        }
+        "jpg" | "png" => {
+            let img = render_text_page_image(text);
+            super::image_ops::write_image_pub(&img, target, out, 90)?;
+        }
+        _ => return Err(unsupported()),
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------- Markdown
@@ -226,7 +468,6 @@ fn parse_cues(src: &str) -> Vec<Cue> {
     cues
 }
 
-/// Normalizes `hh:mm:ss,mmm` / `mm:ss.mmm` to the target separator.
 fn fix_time(t: &str, sep: char) -> String {
     let t = t.replace([',', '.'], ".");
     let (hms, ms) = t.split_once('.').unwrap_or((&t, "000"));
@@ -326,14 +567,61 @@ fn rows_md(rows: &[Vec<String>]) -> String {
     s
 }
 
-fn sheet(text: &str, src: &str, target: &str) -> Result<Vec<u8>> {
-    let rows = read_rows(text, if src == "tsv" { b'\t' } else { b',' })?;
+fn ods(rows: &[Vec<String>]) -> Result<Vec<u8>> {
+    let mut table = String::new();
+    for r in rows {
+        table.push_str("<table:table-row>");
+        for c in r {
+            table.push_str(&format!(
+                "<table:table-cell office:value-type=\"string\"><text:p>{}</text:p></table:table-cell>",
+                xml_escape(c)
+            ));
+        }
+        table.push_str("</table:table-row>");
+    }
+    let content = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><office:document-content xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" xmlns:table=\"urn:oasis:names:tc:opendocument:xmlns:table:1.0\" xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\"><office:body><office:spreadsheet><table:table table:name=\"Sheet1\">{table}</table:table></office:spreadsheet></office:body></office:document-content>"
+    );
+    let manifest = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><manifest:manifest xmlns:manifest=\"urn:oasis:names:tc:opendocument:xmlns:manifest:1.0\"><manifest:file-entry manifest:full-path=\"/\" manifest:media-type=\"application/vnd.oasis.opendocument.spreadsheet\"/><manifest:file-entry manifest:full-path=\"content.xml\" manifest:media-type=\"text/xml\"/></manifest:manifest>";
+    let ze = |e: zip::result::ZipError| ClementineError::ArchiveError(e.to_string());
+    let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let stored = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let deflated = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    z.start_file("mimetype", stored).map_err(ze)?;
+    z.write_all(b"application/vnd.oasis.opendocument.spreadsheet")?;
+    z.start_file("META-INF/manifest.xml", deflated).map_err(ze)?;
+    z.write_all(manifest.as_bytes())?;
+    z.start_file("content.xml", deflated).map_err(ze)?;
+    z.write_all(content.as_bytes())?;
+    Ok(z.finish().map_err(ze)?.into_inner())
+}
+
+fn ods_rows(bytes: &[u8]) -> Result<Vec<Vec<String>>> {
+    let ze = |e: zip::result::ZipError| ClementineError::ArchiveError(e.to_string());
+    let mut z = zip::ZipArchive::new(Cursor::new(bytes)).map_err(ze)?;
+    let mut f = z.by_name("content.xml").map_err(ze)?;
+    let mut xml = String::new();
+    f.read_to_string(&mut xml)?;
+    let mut rows = Vec::new();
+    for r in xml.split("<table:table-row").skip(1) {
+        let mut cells = Vec::new();
+        for c in r.split("<table:table-cell").skip(1) {
+            let body = c.split("</table:table-cell>").next().unwrap_or("");
+            cells.push(xml_texts_tag(body, "text:p"));
+        }
+        rows.push(cells);
+    }
+    Ok(rows)
+}
+
+fn convert_rows(rows: &[Vec<String>], src: &str, target: &str) -> Result<Vec<u8>> {
     Ok(match target {
-        "csv" => write_rows(&rows, b',')?.into_bytes(),
-        "tsv" => write_rows(&rows, b'\t')?.into_bytes(),
-        "html" => rows_html(&rows).into_bytes(),
-        "md" => rows_md(&rows).into_bytes(),
-        "xlsx" => xlsx(&rows)?,
+        "csv" => write_rows(rows, b',')?.into_bytes(),
+        "tsv" => write_rows(rows, b'\t')?.into_bytes(),
+        "html" => rows_html(rows).into_bytes(),
+        "md" => rows_md(rows).into_bytes(),
+        "xlsx" => xlsx(rows)?,
+        "ods" => ods(rows)?,
         "pdf" => {
             let t: String = rows.iter().map(|r| r.join(" | ") + "\n").collect();
             text_pdf(&t)
@@ -344,7 +632,7 @@ fn sheet(text: &str, src: &str, target: &str) -> Result<Vec<u8>> {
     })
 }
 
-// ------------------------------------------------- PDF split / merge
+// ------------------------------------------------- PDF split / merge / FlateDecode
 
 fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     hay.get(from..)?.windows(needle.len()).position(|w| w == needle).map(|i| i + from)
@@ -356,36 +644,69 @@ fn ref_after(s: &str, key: &str) -> Option<u32> {
     rest[..end].parse().ok()
 }
 
-/// Splits an object body into its dictionary text and optional stream bytes.
 fn split_obj(body: &[u8]) -> (String, Option<&[u8]>) {
-    match find(body, b"stream\n", 0) {
-        Some(i) => {
-            let data = &body[i + 7..];
-            let end = data.windows(10).rposition(|w| w == b"\nendstream").unwrap_or(data.len());
+    let stream_marker = find(body, b"stream\r\n", 0)
+        .map(|i| (i, 8))
+        .or_else(|| find(body, b"stream\n", 0).map(|i| (i, 7)));
+    match stream_marker {
+        Some((i, skip)) => {
+            let data = &body[i + skip..];
+            let end = data
+                .windows(9)
+                .rposition(|w| w == b"endstream")
+                .map(|p| {
+                    if p > 0 && (data[p - 1] == b'\n' || data[p - 1] == b'\r') {
+                        if p > 1 && data[p - 2] == b'\r' { p - 2 } else { p - 1 }
+                    } else {
+                        p
+                    }
+                })
+                .unwrap_or(data.len());
             (String::from_utf8_lossy(&body[..i]).into_owned(), Some(&data[..end]))
         }
         None => (String::from_utf8_lossy(body).into_owned(), None),
     }
 }
 
-/// Reads pages back out of an uncompressed PDF (the shape `build_pdf` writes).
-/// ponytail: no filters, xref streams or object streams; swap in a real PDF
-/// parser (lopdf) when foreign PDFs must be split.
+fn decode_pdf_stream(cdict: &str, raw: &[u8]) -> Result<Vec<u8>> {
+    if !cdict.contains("/Filter") {
+        return Ok(raw.to_vec());
+    }
+    if cdict.contains("FlateDecode") {
+        let mut out = Vec::new();
+        if ZlibDecoder::new(raw).read_to_end(&mut out).is_ok() && !out.is_empty() {
+            return Ok(out);
+        }
+        out.clear();
+        if DeflateDecoder::new(raw).read_to_end(&mut out).is_ok() && !out.is_empty() {
+            return Ok(out);
+        }
+        return Err(ClementineError::InvalidInput("pdf: failed to inflate FlateDecode stream".into()));
+    }
+    Err(ClementineError::InvalidInput("pdf: unsupported stream filter".into()))
+}
+
+/// Reads pages out of uncompressed or `FlateDecode`-compressed PDFs.
 pub fn pdf_pages(bytes: &[u8]) -> Result<Vec<PdfPage>> {
     let bad = |m: &str| ClementineError::InvalidInput(format!("pdf: {m}"));
     let mut objs: HashMap<u32, &[u8]> = HashMap::new();
     let mut order = Vec::new();
     let mut start = 0;
-    while let Some(e) = find(bytes, b"\nendobj", start) {
+    while let Some(e) = find(bytes, b"endobj", start) {
         let chunk = &bytes[start..e];
-        start = e + 7;
-        let Some(p) = find(chunk, b" 0 obj\n", 0) else { continue };
+        start = e + 6;
+        let obj_pos = find(chunk, b" 0 obj", 0);
+        let Some(p) = obj_pos else { continue };
         let head = &chunk[..p];
         let digits = head.iter().rev().take_while(|b| b.is_ascii_digit()).count();
         let Ok(id) = String::from_utf8_lossy(&head[head.len() - digits..]).parse::<u32>() else {
             continue;
         };
-        objs.insert(id, &chunk[p + 7..]);
+        let mut body_start = p + 6;
+        while body_start < chunk.len() && (chunk[body_start] == b'\r' || chunk[body_start] == b'\n') {
+            body_start += 1;
+        }
+        objs.insert(id, &chunk[body_start..]);
         order.push(id);
     }
     let mut pages = Vec::new();
@@ -397,10 +718,8 @@ pub fn pdf_pages(bytes: &[u8]) -> Result<Vec<PdfPage>> {
         }
         let cid = ref_after(&dict, "/Contents").ok_or_else(|| bad("page without /Contents"))?;
         let (cdict, data) = split_obj(objs.get(&cid).ok_or_else(|| bad("missing content"))?);
-        if cdict.contains("/Filter") {
-            return Err(bad("compressed content streams are not supported"));
-        }
-        let content = data.ok_or_else(|| bad("content is not a stream"))?.to_vec();
+        let raw = data.ok_or_else(|| bad("content is not a stream"))?;
+        let content = decode_pdf_stream(&cdict, raw)?;
         let (mut w, mut h) = (595.0, 842.0);
         if let Some(i) = dict.find("/MediaBox") {
             let inner = dict[i..].split(['[', ']']).nth(1).unwrap_or("");
@@ -427,6 +746,33 @@ pub fn pdf_pages(bytes: &[u8]) -> Result<Vec<PdfPage>> {
         return Err(bad("no pages found"));
     }
     Ok(pages)
+}
+
+pub fn pdf_to_text(bytes: &[u8]) -> Result<String> {
+    let pages = pdf_pages(bytes)?;
+    let mut out = String::new();
+    for p in pages {
+        let s = String::from_utf8_lossy(&p.content);
+        let chars: Vec<char> = s.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '(' {
+                i += 1;
+                let mut line = String::new();
+                while i < chars.len() && chars[i] != ')' {
+                    if chars[i] == '\\' && i + 1 < chars.len() {
+                        i += 1;
+                    }
+                    line.push(chars[i]);
+                    i += 1;
+                }
+                out.push_str(&line);
+                out.push('\n');
+            }
+            i += 1;
+        }
+    }
+    Ok(out.trim().to_string() + "\n")
 }
 
 /// Writes every page of `src` as `Page N.pdf` inside `out_dir`.
@@ -516,25 +862,29 @@ fn unescape(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
-/// Concatenated text of every `<t>` element in `s`.
-fn xml_texts(s: &str) -> String {
+fn xml_texts_tag(s: &str, tag: &str) -> String {
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
     let mut out = String::new();
     let mut rest = s;
-    while let Some(i) = rest.find("<t") {
-        rest = &rest[i + 2..];
+    while let Some(i) = rest.find(&open) {
+        rest = &rest[i + open.len()..];
         if !rest.starts_with('>') && !rest.starts_with(' ') {
             continue;
         }
         let Some(gt) = rest.find('>') else { break };
         rest = &rest[gt + 1..];
-        let end = rest.find("</t>").unwrap_or(rest.len());
+        let end = rest.find(&close).unwrap_or(rest.len());
         out.push_str(&unescape(&rest[..end]));
         rest = &rest[end..];
     }
     out
 }
 
-/// ponytail: first sheet only; empty cells are not padded by column reference.
+fn xml_texts(s: &str) -> String {
+    xml_texts_tag(s, "t")
+}
+
 fn xlsx_rows(bytes: &[u8]) -> Result<Vec<Vec<String>>> {
     let ze = |e: zip::result::ZipError| ClementineError::ArchiveError(e.to_string());
     let mut z = zip::ZipArchive::new(Cursor::new(bytes)).map_err(ze)?;
@@ -635,42 +985,90 @@ fn html_to_text(html: &str, md: bool) -> String {
 
 // ----------------------------------------------------------------- entry
 
+pub fn is_doc_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "srt" | "vtt" | "csv" | "tsv" | "md" | "txt" | "xlsx" | "xls" | "ods" | "html"
+            | "pdf" | "docx" | "pages" | "epub" | "rtf" | "rtfd" | "textclipping" | "pptx" | "ppt"
+    )
+}
+
 pub fn convert(path: &Path, src: &str, target: &str, out: &Path) -> Result<()> {
     let raw = fs::read(path)?;
     let text = String::from_utf8_lossy(&raw).into_owned();
     let unsupported = || ClementineError::UnsupportedConversion { from: src.into(), to: target.into() };
-    let bytes: Vec<u8> = match src {
-        "srt" | "vtt" => subtitles(&text, src, target)?.into_bytes(),
-        "csv" | "tsv" => sheet(&text, src, target)?,
-        "xlsx" => match target {
-            "csv" => write_rows(&xlsx_rows(&raw)?, b',')?.into_bytes(),
-            "tsv" => write_rows(&xlsx_rows(&raw)?, b'\t')?.into_bytes(),
-            _ => return Err(unsupported()),
-        },
-        "html" => match target {
-            "txt" | "md" => html_to_text(&text, target == "md").into_bytes(),
-            _ => return Err(unsupported()),
-        },
-        "md" | "txt" => {
-            let plain = || if src == "md" { md_to_text(&text) } else { text.clone() };
-            match target {
-                "html" => (if src == "md" { md_to_html(&text) } else { txt_to_html(&text) }).into_bytes(),
-                "txt" if src == "md" => md_to_text(&text).into_bytes(),
-                "md" if src == "txt" => text.clone().into_bytes(),
-                "pdf" => text_pdf(&plain()),
-                "docx" => docx(&plain())?,
-                _ => return Err(unsupported()),
-            }
+    match src {
+        "srt" | "vtt" => {
+            fs::write(out, subtitles(&text, src, target)?.into_bytes())?;
+            Ok(())
         }
-        _ => return Err(unsupported()),
-    };
-    fs::write(out, bytes)?;
-    Ok(())
+        "csv" | "tsv" => {
+            let rows = read_rows(&text, if src == "tsv" { b'\t' } else { b',' })?;
+            fs::write(out, convert_rows(&rows, src, target)?)?;
+            Ok(())
+        }
+        "xlsx" | "xls" => {
+            let rows = xlsx_rows(&raw).or_else(|_| read_rows(&text, b'\t'))?;
+            fs::write(out, convert_rows(&rows, src, target)?)?;
+            Ok(())
+        }
+        "ods" => {
+            let rows = ods_rows(&raw)?;
+            fs::write(out, convert_rows(&rows, src, target)?)?;
+            Ok(())
+        }
+        "html" => match target {
+            "txt" | "md" => {
+                fs::write(out, html_to_text(&text, target == "md").into_bytes())?;
+                Ok(())
+            }
+            _ => write_text_target(&html_to_text(&text, false), src, target, out),
+        },
+        "md" | "txt" | "textclipping" => {
+            if src == "md" && target == "html" {
+                fs::write(out, md_to_html(&text).into_bytes())?;
+                return Ok(());
+            }
+            let plain = if src == "md" { md_to_text(&text) } else { text };
+            write_text_target(&plain, src, target, out)
+        }
+        "docx" | "pages" => {
+            let plain = docx_to_text(&raw)?;
+            write_text_target(&plain, src, target, out)
+        }
+        "epub" => {
+            let plain = epub_to_text(&raw)?;
+            write_text_target(&plain, src, target, out)
+        }
+        "rtf" | "rtfd" => {
+            let plain = rtf_to_text(&text);
+            write_text_target(&plain, src, target, out)
+        }
+        "pptx" | "ppt" => {
+            let plain = pptx_to_text(&raw)?;
+            write_text_target(&plain, src, target, out)
+        }
+        "pdf" => {
+            if matches!(target, "jpg" | "png") {
+                if let Ok(pages) = pdf_pages(&raw) {
+                    if let Some((jpeg_bytes, _, _)) = pages.first().and_then(|p| p.jpeg.as_ref()) {
+                        if let Ok(img) = image::load_from_memory(jpeg_bytes) {
+                            return super::image_ops::write_image_pub(&img, target, out, 90);
+                        }
+                    }
+                }
+            }
+            let plain = pdf_to_text(&raw)?;
+            write_text_target(&plain, src, target, out)
+        }
+        _ => Err(unsupported()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::execute_conversion;
+    use super::*;
     use std::fs;
     use std::io::Read;
 
@@ -692,11 +1090,7 @@ mod tests {
         let txt = run(d.path(), "b.srt", SRT, "txt");
         assert_eq!(txt, "Hello\nthere\nBye\n");
         let short = run(d.path(), "c.vtt", "WEBVTT\n\n01.000 --> 02.000 align:start\nHi\n", "srt");
-        assert_eq!(short, "1
-00:00:01,000 --> 00:00:02,000
-Hi
-
-");
+        assert_eq!(short, "1\n00:00:01,000 --> 00:00:02,000\nHi\n\n");
     }
 
     #[test]
@@ -728,14 +1122,64 @@ Hi
         assert!(pdf.windows(13).any(|w| w == b"(Title) Tj T*"));
         assert!(String::from_utf8_lossy(&pdf).contains("\\(with parens\\)"));
 
-        let docx = execute_conversion(&p, "docx").unwrap();
-        let mut z = zip::ZipArchive::new(fs::File::open(docx).unwrap()).unwrap();
+        let docx_path = execute_conversion(&p, "docx").unwrap();
+        let mut z = zip::ZipArchive::new(fs::File::open(&docx_path).unwrap()).unwrap();
         for name in ["[Content_Types].xml", "_rels/.rels", "word/document.xml"] {
             assert!(z.by_name(name).is_ok(), "{name}");
         }
         let mut doc = String::new();
         z.by_name("word/document.xml").unwrap().read_to_string(&mut doc).unwrap();
         assert!(doc.contains(">Title<"));
+    }
+
+    #[test]
+    fn docx_epub_pptx_ods_pdf_roundtrips_and_flatedecode() {
+        let d = tempfile::tempdir().unwrap();
+        let txt_path = d.path().join("sample.txt");
+        fs::write(&txt_path, "Hello Clementine\nLine Two\n").unwrap();
+
+        // TXT -> DOCX -> TXT & PDF
+        let docx_p = execute_conversion(&txt_path, "docx").unwrap();
+        let from_docx = fs::read_to_string(execute_conversion(&docx_p, "txt").unwrap()).unwrap();
+        assert!(from_docx.contains("Hello Clementine"));
+
+        // TXT -> EPUB -> MD
+        let epub_p = execute_conversion(&txt_path, "epub").unwrap();
+        let from_epub = fs::read_to_string(execute_conversion(&epub_p, "md").unwrap()).unwrap();
+        assert!(from_epub.contains("Hello Clementine"));
+
+        // TXT -> PDF -> PPTX -> PDF & JPG
+        let pdf_p = execute_conversion(&txt_path, "pdf").unwrap();
+        let pptx_p = execute_conversion(&pdf_p, "pptx").unwrap();
+        let pptx_jpg = execute_conversion(&pptx_p, "jpg").unwrap();
+        assert!(pptx_jpg.exists());
+
+        // CSV -> ODS -> XLSX -> PDF
+        let csv_p = d.path().join("data.csv");
+        fs::write(&csv_p, "col1,col2\nval1,val2\n").unwrap();
+        let ods_p = execute_conversion(&csv_p, "ods").unwrap();
+        let xlsx_p = execute_conversion(&ods_p, "xlsx").unwrap();
+        let sheet_pdf = execute_conversion(&xlsx_p, "pdf").unwrap();
+        assert!(sheet_pdf.exists());
+
+        // RTF -> TXT
+        let rtf_p = d.path().join("note.rtf");
+        fs::write(&rtf_p, "{\\rtf1\\ansi{\\fonttbl\\f0 Arial;}\\f0 Hello RTF\\par Second line}").unwrap();
+        let rtf_txt = fs::read_to_string(execute_conversion(&rtf_p, "txt").unwrap()).unwrap();
+        assert!(rtf_txt.contains("Hello RTF") && rtf_txt.contains("Second line"));
+
+        // FlateDecode compressed PDF stream parsing
+        let raw_stream = b"BT /F1 11 Tf 50 792 Td (Compressed PDF Line) Tj ET";
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(raw_stream).unwrap();
+        let compressed = enc.finish().unwrap();
+        let mut flate_pdf = Vec::new();
+        flate_pdf.extend_from_slice(b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /MediaBox [0 0 595 842] /Contents 4 0 R >>\nendobj\n");
+        flate_pdf.extend_from_slice(format!("4 0 obj\n<< /Length {} /Filter /FlateDecode >>\nstream\n", compressed.len()).as_bytes());
+        flate_pdf.extend_from_slice(&compressed);
+        flate_pdf.extend_from_slice(b"\nendstream\nendobj\n%%EOF\n");
+        let parsed = pdf_to_text(&flate_pdf).unwrap();
+        assert!(parsed.contains("Compressed PDF Line"));
     }
 
     #[test]

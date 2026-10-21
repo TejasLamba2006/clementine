@@ -52,6 +52,8 @@ struct ModalState {
     pills: Vec<&'static str>,
     active_pill: usize,
     active_swatch: usize,
+    box_center: (f32, f32),
+    dragging_canvas: bool,
     dragging_slider: Option<usize>,
     applied: Option<ToolParams>,
     auto_step: u32,
@@ -341,6 +343,8 @@ impl ModalState {
             pills,
             active_pill,
             active_swatch: 0,
+            box_center: (0.5, 0.5),
+            dragging_canvas: false,
             dragging_slider: None,
             applied: None,
             auto_step: 0,
@@ -446,21 +450,33 @@ impl ModalState {
                 let (w, h) = self.source_dims;
                 let cw = (((w as f32 * val(0, 82.0) / 100.0).round() as u32) & !1).max(8);
                 let ch = (((h as f32 * val(1, 82.0) / 100.0).round() as u32) & !1).max(8);
-                p.crop_rect = Some(((w.saturating_sub(cw)) / 2, (h.saturating_sub(ch)) / 2, cw, ch));
+                let cx = (w as f32 * self.box_center.0).round() as u32;
+                let cy = (h as f32 * self.box_center.1).round() as u32;
+                let x = cx.saturating_sub(cw / 2).min(w.saturating_sub(cw));
+                let y = cy.saturating_sub(ch / 2).min(h.saturating_sub(ch));
+                p.crop_rect = Some((x, y, cw, ch));
             }
             "redactImage" => {
                 p.redact_solid = self.active_pill == 1;
                 let (w, h) = self.source_dims;
                 let rw = ((w as f32 * val(0, 48.0) / 100.0).round() as u32).max(8);
                 let rh = ((h as f32 * val(1, 34.0) / 100.0).round() as u32).max(8);
-                p.crop_rect = Some(((w.saturating_sub(rw)) / 2, (h.saturating_sub(rh)) / 2, rw, rh));
+                let cx = (w as f32 * self.box_center.0).round() as u32;
+                let cy = (h as f32 * self.box_center.1).round() as u32;
+                let x = cx.saturating_sub(rw / 2).min(w.saturating_sub(rw));
+                let y = cy.saturating_sub(rh / 2).min(h.saturating_sub(rh));
+                p.crop_rect = Some((x, y, rw, rh));
             }
             "redactVideo" => {
                 p.redact_solid = self.active_pill == 1;
                 let (w, h) = self.source_dims;
                 let rw = ((w as f32 * val(0, 48.0) / 100.0).round() as u32).max(8);
                 let rh = ((h as f32 * val(1, 34.0) / 100.0).round() as u32).max(8);
-                p.crop_rect = Some(((w.saturating_sub(rw)) / 2, (h.saturating_sub(rh)) / 2, rw, rh));
+                let cx = (w as f32 * self.box_center.0).round() as u32;
+                let cy = (h as f32 * self.box_center.1).round() as u32;
+                let x = cx.saturating_sub(rw / 2).min(w.saturating_sub(rw));
+                let y = cy.saturating_sub(rh / 2).min(h.saturating_sub(rh));
+                p.crop_rect = Some((x, y, rw, rh));
                 p.start_sec = val(2, 0.0);
                 p.end_sec = Some(val(3, dur).max(p.start_sec + 0.1));
             }
@@ -471,6 +487,15 @@ impl ModalState {
                     3 => [24, 128, 255, 255],
                     _ => [255, 82, 0, 255],
                 };
+                let (w, h) = self.source_dims;
+                let scale = val(0, 54.0) / 100.0;
+                let aw = ((w as f32 * scale).round() as u32).max(12);
+                let ah = ((h as f32 * scale).round() as u32).max(12);
+                let cx = (w as f32 * self.box_center.0).round() as u32;
+                let cy = (h as f32 * self.box_center.1).round() as u32;
+                let x = cx.saturating_sub(aw / 2).min(w.saturating_sub(aw));
+                let y = cy.saturating_sub(ah / 2).min(h.saturating_sub(ah));
+                p.crop_rect = Some((x, y, aw, ah));
             }
             "createCollage" => {
                 p.collage_cols = val(0, 2.0).round().clamp(1.0, 4.0) as u32;
@@ -857,22 +882,33 @@ fn render_modal(st: &ModalState) -> Vec<u32> {
             let ox = 230 - preview.width() as i32 / 2;
             let oy = 158 - preview.height() as i32 / 2;
             blit_rgba(&mut buf, &preview, ox, oy, 8.0);
+            let pw = preview.width() as f64;
+            let ph = preview.height() as f64;
             if st.tool_id == "cropImage" || st.tool_id == "cropVideo" {
-                let cw = preview.width() as f64 * (st.sliders.first().map(|s| s.val).unwrap_or(82.0) as f64 / 100.0) * 0.5;
-                let ch = preview.height() as f64 * (st.sliders.get(1).map(|s| s.val).unwrap_or(82.0) as f64 / 100.0) * 0.5;
-                stroke_rrect(&mut buf, 230.0, 158.0, cw, ch, 2.0, 2.5, orange, 1.0);
+                let cw = pw * (st.sliders.first().map(|s| s.val).unwrap_or(82.0) as f64 / 100.0) * 0.5;
+                let ch = ph * (st.sliders.get(1).map(|s| s.val).unwrap_or(82.0) as f64 / 100.0) * 0.5;
+                let bcx = (ox as f64 + pw * st.box_center.0 as f64).clamp(ox as f64 + cw, ox as f64 + pw - cw);
+                let bcy = (oy as f64 + ph * st.box_center.1 as f64).clamp(oy as f64 + ch, oy as f64 + ph - ch);
+                stroke_rrect(&mut buf, bcx, bcy, cw, ch, 2.0, 2.5, orange, 1.0);
                 for (dx, dy) in [(-cw, -ch), (cw, -ch), (-cw, ch), (cw, ch)] {
-                    fill_rrect(&mut buf, 230.0 + dx, 158.0 + dy, 4.5, 4.5, 2.0, orange, 1.0);
+                    fill_rrect(&mut buf, bcx + dx, bcy + dy, 4.5, 4.5, 2.0, orange, 1.0);
                 }
             } else if st.tool_id == "redactImage" || st.tool_id == "redactVideo" {
-                let rw = preview.width() as f64 * (st.sliders.first().map(|s| s.val).unwrap_or(48.0) as f64 / 100.0) * 0.5;
-                let rh = preview.height() as f64 * (st.sliders.get(1).map(|s| s.val).unwrap_or(34.0) as f64 / 100.0) * 0.5;
+                let rw = pw * (st.sliders.first().map(|s| s.val).unwrap_or(48.0) as f64 / 100.0) * 0.5;
+                let rh = ph * (st.sliders.get(1).map(|s| s.val).unwrap_or(34.0) as f64 / 100.0) * 0.5;
+                let bcx = (ox as f64 + pw * st.box_center.0 as f64).clamp(ox as f64 + rw, ox as f64 + pw - rw);
+                let bcy = (oy as f64 + ph * st.box_center.1 as f64).clamp(oy as f64 + rh, oy as f64 + ph - rh);
                 let col = if st.active_pill == 1 { c8(8, 8, 8) } else { c8(90, 110, 120) };
-                fill_rrect(&mut buf, 230.0, 156.0, rw, rh, 4.0, col, 0.94);
-                stroke_rrect(&mut buf, 230.0, 156.0, rw, rh, 4.0, 2.2, orange, 1.0);
+                fill_rrect(&mut buf, bcx, bcy, rw, rh, 4.0, col, 0.94);
+                stroke_rrect(&mut buf, bcx, bcy, rw, rh, 4.0, 2.2, orange, 1.0);
             } else if st.tool_id == "annotateImage" {
+                let scale = st.sliders.first().map(|s| s.val).unwrap_or(54.0) as f64 / 100.0;
+                let aw = pw * scale * 0.5;
+                let ah = ph * scale * 0.5;
+                let bcx = (ox as f64 + pw * st.box_center.0 as f64).clamp(ox as f64 + aw, ox as f64 + pw - aw);
+                let bcy = (oy as f64 + ph * st.box_center.1 as f64).clamp(oy as f64 + ah, oy as f64 + ph - ah);
                 let ac = c8(params.annotation_color[0], params.annotation_color[1], params.annotation_color[2]);
-                stroke_rrect(&mut buf, 230.0, 152.0, 56.0, 34.0, 6.0, 3.0, ac, 1.0);
+                stroke_rrect(&mut buf, bcx, bcy, aw, ah, 6.0, 3.0, ac, 1.0);
             } else if st.tool_id == "compress" {
                 let q = st.sliders.first().map(|s| s.val).unwrap_or(74.0);
                 let pct = (100.0 - q * 0.65).round() as i32;
@@ -1000,6 +1036,17 @@ fn update_slider_at(st: &mut ModalState, idx: usize, mx: i32) {
     }
 }
 
+fn update_canvas_box_at(st: &mut ModalState, mx: i32, my: i32) {
+    let pw = st.thumb.width().max(1) as f32;
+    let ph = st.thumb.height().max(1) as f32;
+    let ox = 230.0 - pw * 0.5;
+    let oy = 158.0 - ph * 0.5;
+    st.box_center = (
+        ((mx as f32 - ox) / pw).clamp(0.1, 0.9),
+        ((my as f32 - oy) / ph).clamp(0.1, 0.9),
+    );
+}
+
 unsafe extern "system" fn modal_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let mx = (lp as i16) as i32;
     let my = ((lp >> 16) as i16) as i32;
@@ -1029,16 +1076,29 @@ unsafe extern "system" fn modal_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM)
                         st.pills = pills;
                         st.active_pill = 0;
                         st.active_swatch = 0;
+                        st.box_center = (0.5, 0.5);
                     }
                 });
                 present_modal(hwnd);
                 return 0;
             }
-            // 4. Direct timeline scrubbing on filmstrip / waveform (y = 196..252, x = 50..410)
+            // 4. Direct timeline scrubbing or canvas box dragging
             let mut changed = false;
             MODAL.with(|c| {
                 let mut g = c.borrow_mut();
                 let Some(st) = g.as_mut() else { return };
+                if matches!(
+                    st.tool_id.as_str(),
+                    "cropImage" | "cropVideo" | "redactImage" | "redactVideo" | "annotateImage"
+                ) && (60..=254).contains(&my)
+                    && (48..=412).contains(&mx)
+                {
+                    st.dragging_canvas = true;
+                    update_canvas_box_at(st, mx, my);
+                    SetCapture(hwnd);
+                    changed = true;
+                    return;
+                }
                 if matches!(st.tool_id.as_str(), "trimVideo" | "splitVideo" | "videoSnapshots")
                     && (198..=248).contains(&my)
                     && (50..=410).contains(&mx)
@@ -1103,7 +1163,10 @@ unsafe extern "system" fn modal_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM)
             let updated = MODAL.with(|c| {
                 let mut g = c.borrow_mut();
                 let Some(st) = g.as_mut() else { return false };
-                if let Some(idx) = st.dragging_slider {
+                if st.dragging_canvas {
+                    update_canvas_box_at(st, mx, my);
+                    true
+                } else if let Some(idx) = st.dragging_slider {
                     update_slider_at(st, idx, mx);
                     true
                 } else {
@@ -1119,6 +1182,10 @@ unsafe extern "system" fn modal_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM)
             let mut need_redraw = false;
             MODAL.with(|c| {
                 if let Some(st) = c.borrow_mut().as_mut() {
+                    if st.dragging_canvas {
+                        st.dragging_canvas = false;
+                        ReleaseCapture();
+                    }
                     if let Some(idx) = st.dragging_slider.take() {
                         ReleaseCapture();
                         if matches!(st.tool_id.as_str(), "trimVideo" | "splitVideo" | "videoSnapshots") {
@@ -1278,5 +1345,11 @@ mod tests {
         ch.on_pill_clicked(1); // Stereo
         let pch = ch.build_params();
         assert!(!pch.mono && (pch.left_gain - 0.5).abs() < 0.01);
+
+        let mut crop = ModalState::new("cropImage", vec![]);
+        let center_rect = crop.build_params().crop_rect.unwrap();
+        update_canvas_box_at(&mut crop, 140, 100);
+        let moved_rect = crop.build_params().crop_rect.unwrap();
+        assert!(moved_rect.0 < center_rect.0 && moved_rect.1 < center_rect.1);
     }
 }

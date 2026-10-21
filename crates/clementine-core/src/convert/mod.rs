@@ -163,9 +163,9 @@ enum Kind {
 }
 
 fn route(src: &str, target: &str) -> Option<Kind> {
-    if matches!(src, "zip" | "tar" | "gz") {
+    if matches!(src, "zip" | "tar" | "gz" | "rar") {
         Some(Kind::Archive)
-    } else if matches!(src, "srt" | "vtt" | "csv" | "tsv" | "md" | "txt" | "xlsx" | "html") {
+    } else if doc_ops::is_doc_ext(src) {
         Some(Kind::Doc)
     } else if src == "gif" && media_ops::is_video_ext(target) {
         Some(Kind::Media)

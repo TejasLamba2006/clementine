@@ -54,8 +54,9 @@ fn render_shelf(files: &[PathBuf]) -> Vec<u32> {
             over(&mut buf[i], orange, 0.45 * (c - inner).max(0.0));
         }
     }
-    blit_mask_sized(&mut buf, SW, SH, &fit_mask("FLOAT SHELF", 11, 700, 160), 74.0, 22.0, orange);
-    blit_mask_sized(&mut buf, SW, SH, &fit_mask(&format!("{} pinned", files.len()), 10, 600, 80), 210.0, 22.0, c8(110, 96, 86));
+    blit_mask_sized(&mut buf, SW, SH, &fit_mask("FLOAT SHELF", 11, 700, 140), 66.0, 22.0, orange);
+    blit_mask_sized(&mut buf, SW, SH, &fit_mask("Copy All", 10, 700, 68), 182.0, 22.0, orange);
+    blit_mask_sized(&mut buf, SW, SH, &fit_mask("Clear", 10, 600, 50), 232.0, 22.0, c8(110, 96, 86));
 
     for (idx, p) in files.iter().take(3).enumerate() {
         let ry = 54.0 + idx as f64 * 34.0;
@@ -99,11 +100,26 @@ fn present_shelf(h: HWND) {
 unsafe extern "system" fn proc(h: HWND, m: u32, _wp: WPARAM, lp: LPARAM) -> LRESULT {
     match m {
         WM_LBUTTONDOWN => {
+            let x = (lp as i16) as i32;
             let y = ((lp >> 16) as i16) as i32;
             let files = FILES.lock().unwrap().clone();
+            if y < 36 {
+                if (150..=208).contains(&x) {
+                    crate::actions::copy_files(h, &files);
+                    return 0;
+                }
+                if x >= 210 {
+                    FILES.lock().unwrap().clear();
+                    ShowWindow(h, SW_HIDE);
+                    return 0;
+                }
+                SendMessageW(h, WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+                return 0;
+            }
             if y >= 40 {
                 let idx = ((y - 40) / 34).max(0) as usize;
                 if let Some(p) = files.get(idx) {
+                    crate::actions::copy_files(h, std::slice::from_ref(p));
                     let op = w("open");
                     let f = w(&p.display().to_string());
                     ShellExecuteW(h, op.as_ptr(), f.as_ptr(), null(), null(), SW_SHOW);

@@ -13,7 +13,7 @@ use super::{ClementineError, Result, ToolParams};
 pub fn is_image_ext(ext: &str) -> bool {
     matches!(
         ext,
-        "jpg" | "jpeg" | "png" | "webp" | "bmp" | "tiff" | "tif" | "gif" | "ico" | "svg"
+        "jpg" | "jpeg" | "png" | "webp" | "bmp" | "tiff" | "tif" | "gif" | "ico" | "svg" | "heic" | "heif" | "avif"
     )
 }
 
@@ -220,6 +220,12 @@ fn load(path: &Path) -> Result<DynamicImage> {
     if ext.as_deref() == Some("svg") {
         return Ok(DynamicImage::ImageRgba8(render_svg(&fs::read_to_string(path)?)?));
     }
+    if let Ok(img) = image::open(path) {
+        return Ok(img);
+    }
+    if let Some(rgba) = super::media_ops::extract_video_frame_rgba(path, 0.0, 4096, 4096) {
+        return Ok(DynamicImage::ImageRgba8(rgba));
+    }
     image::open(path).map_err(ie)
 }
 
@@ -251,6 +257,10 @@ fn image_page(img: &DynamicImage) -> Result<PdfPage> {
     })
 }
 
+pub(crate) fn write_image_pub(img: &DynamicImage, ext: &str, out: &Path, quality: u8) -> Result<()> {
+    write_image(img, ext, out, quality)
+}
+
 fn write_image(img: &DynamicImage, ext: &str, out: &Path, quality: u8) -> Result<()> {
     match ext {
         "jpg" | "jpeg" => fs::write(out, encode_jpeg(img, quality)?)?,
@@ -269,6 +279,13 @@ fn write_image(img: &DynamicImage, ext: &str, out: &Path, quality: u8) -> Result
             }
             let mut buf = Cursor::new(Vec::new());
             rgba.write_to(&mut buf, fmt).map_err(ie)?;
+            fs::write(out, buf.into_inner())?;
+        }
+        "heic" | "heif" | "avif" => {
+            let mut buf = Cursor::new(Vec::new());
+            DynamicImage::ImageRgba8(img.to_rgba8())
+                .write_to(&mut buf, ImageFormat::WebP)
+                .map_err(ie)?;
             fs::write(out, buf.into_inner())?;
         }
         other => return Err(ie(format!("cannot write .{other}"))),

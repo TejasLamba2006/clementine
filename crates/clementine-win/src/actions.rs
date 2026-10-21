@@ -49,7 +49,7 @@ pub fn hdrop_bytes(paths: &[PathBuf]) -> Vec<u8> {
     b
 }
 
-fn copy(hwnd: HWND, paths: &[PathBuf]) {
+pub fn copy_files(hwnd: HWND, paths: &[PathBuf]) {
     unsafe { set_clipboard(hwnd, CF_HDROP, &hdrop_bytes(paths)) }
 }
 
@@ -105,7 +105,8 @@ fn move_files(hwnd: HWND, paths: &[PathBuf]) {
     }
 }
 
-fn share(paths: &[PathBuf]) {
+fn share(hwnd: HWND, paths: &[PathBuf]) {
+    copy_files(hwnd, paths);
     if let Some(p) = paths.first() {
         let _ = Command::new("explorer.exe").arg(format!("/select,{}", p.display())).spawn();
     }
@@ -114,9 +115,9 @@ fn share(paths: &[PathBuf]) {
 /// Runs action `id` (an `action_targets` id) on `paths`.
 pub fn run(hwnd: HWND, id: &str, paths: &[PathBuf]) {
     match id {
-        "airDrop" => share(paths),
+        "airDrop" => share(hwnd, paths),
         "float" => crate::shelf::add(hwnd, paths),
-        "copy" => copy(hwnd, paths),
+        "copy" => copy_files(hwnd, paths),
         "move" => move_files(hwnd, paths),
         "copyPath" => copy_path(hwnd, paths),
         "openTerminal" => open_terminal(paths),
