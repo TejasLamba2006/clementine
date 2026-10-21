@@ -63,8 +63,28 @@ pub struct ToolParams {
     pub collage_cols: u32,
     /// `audioChannels`: mono when true, else stereo.
     pub mono: bool,
-    /// 0-based page indices for `organizePDF`.
+    /// 0-based page/clip indices for `organizePDF`, `mergePDF`, and `joinVideos`.
     pub page_order: Vec<usize>,
+    /// `trimAudio`: automatically strip leading and trailing silence while keeping internal pauses.
+    pub trim_silence: bool,
+    /// `audioChannels`: left channel volume multiplier `0.0..=1.0`.
+    pub left_gain: f32,
+    /// `audioChannels`: right channel volume multiplier `0.0..=1.0`.
+    pub right_gain: f32,
+    /// `normalizeAudio`: target integrated loudness in LUFS (`-24.0..=-8.0`).
+    pub target_lufs: f32,
+    /// `normalizeAudio`: loudness range in LU (`1.0..=20.0`).
+    pub loudness_range: f32,
+    /// `normalizeAudio`: true peak limit in dBTP (`-6.0..=0.0`).
+    pub true_peak: f32,
+    /// `audioToVideo`: `0 = 16:9 (1280x720)`, `1 = 9:16 (720x1280)`, `2 = 1:1 (720x720)`.
+    pub visualizer_shape: u8,
+    /// `audioToVideo`: `false = Waveform (cline)`, `true = Bars (p2p)`.
+    pub visualizer_bars: bool,
+    /// `splitVideo`: custom split timestamps in seconds.
+    pub split_points: Vec<f32>,
+    /// `videoSnapshots`: timestamps in seconds to export as PNG frames.
+    pub snapshot_times: Vec<f32>,
 }
 
 impl Default for ToolParams {
@@ -91,6 +111,16 @@ impl Default for ToolParams {
             collage_cols: 2,
             mono: true,
             page_order: vec![],
+            trim_silence: false,
+            left_gain: 1.0,
+            right_gain: 1.0,
+            target_lufs: -16.0,
+            loudness_range: 11.0,
+            true_peak: -1.5,
+            visualizer_shape: 0,
+            visualizer_bars: false,
+            split_points: vec![],
+            snapshot_times: vec![],
         }
     }
 }
@@ -241,7 +271,14 @@ fn dispatch(
         }
         "organizePDF" => doc_ops::organize_pdf(&job[0], &params.page_order, out),
         "splitPDF" => doc_ops::split_pdf(&job[0], out),
-        "mergePDF" => doc_ops::merge_pdf(job, out),
+        "mergePDF" => {
+            if params.page_order.is_empty() {
+                doc_ops::merge_pdf(job, out)
+            } else {
+                let ordered: Vec<PathBuf> = params.page_order.iter().filter_map(|&idx| job.get(idx).cloned()).collect();
+                doc_ops::merge_pdf(&ordered, out)
+            }
+        }
         "extractArchive" => archive_ops::extract(&job[0], ext, out),
         "muteVideo" | "trimVideo" | "cropVideo" | "redactVideo" | "trimAudio" | "changeVideoSpeed" | "normalizeAudio"
         | "audioChannels" | "audioToVideo" | "redactAudio" | "splitVideo" | "joinVideos"

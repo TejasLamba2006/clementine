@@ -1,6 +1,9 @@
 //! Phase 2 interactive warm-glass Tool Windows (`460x540` layered Win32 modal).
 use crate::renderer::{blit_mask_sized, fit_mask, rounded_box_sdf, seg_dist, Dib, Px};
 use clementine_core::convert::image_ops::{apply_frame_bg, apply_photo_edits};
+use clementine_core::convert::media_ops::{
+    extract_video_filmstrip, extract_video_frame_rgba, is_video_ext, probe_duration_secs,
+};
 use clementine_core::{tool_meta, ToolParams};
 use image::{imageops, Rgba, RgbaImage};
 use std::cell::RefCell;
@@ -40,7 +43,11 @@ struct Slider {
 struct ModalState {
     tool_id: String,
     title: String,
+    paths: Vec<PathBuf>,
+    source_dims: (u32, u32),
+    duration: f32,
     thumb: RgbaImage,
+    filmstrip: Vec<RgbaImage>,
     sliders: Vec<Slider>,
     pills: Vec<&'static str>,
     active_pill: usize,
@@ -120,7 +127,6 @@ fn sample_photo(w: u32, h: u32) -> RgbaImage {
     RgbaImage::from_fn(w, h, |x, y| {
         let u = x as f32 / w.max(1) as f32;
         let v = y as f32 / h.max(1) as f32;
-        // Sky blue top with warm golden sun/flower in center and green hills at bottom
         let mut r = (28.0 + 95.0 * v) as f32;
         let mut g = (138.0 + 75.0 * (1.0 - v * 0.5)) as f32;
         let mut b = (218.0 - 55.0 * v) as f32;
@@ -146,16 +152,48 @@ fn sample_photo(w: u32, h: u32) -> RgbaImage {
     })
 }
 
-fn load_thumb(paths: &[PathBuf]) -> RgbaImage {
-    if let Some(p) = paths.first() {
-        if let Ok(img) = image::open(p) {
-            return imageops::resize(&img.to_rgba8(), 220, 168, imageops::FilterType::Triangle);
-        }
-    }
-    sample_photo(220, 168)
+fn is_video_tool(tool_id: &str) -> bool {
+    matches!(
+        tool_id,
+        "trimVideo" | "cropVideo" | "changeVideoSpeed" | "splitVideo" | "videoSnapshots" | "redactVideo" | "joinVideos"
+    )
 }
 
-fn default_controls(tool_id: &str) -> (Vec<Slider>, Vec<&'static str>) {
+fn load_media_assets(tool_id: &str, paths: &[PathBuf]) -> (RgbaImage, (u32, u32), f32, Vec<RgbaImage>) {
+    let mut duration = 4.0f32;
+    if let Some(p) = paths.first() {
+        let ext = p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+        if is_video_ext(&ext) || is_video_tool(tool_id) || matches!(tool_id, "trimAudio" | "redactAudio" | "normalizeAudio" | "audioChannels" | "audioToVideo") {
+            let d = probe_duration_secs(p);
+            if d > 0.1 {
+                duration = d;
+            }
+        }
+        if is_video_ext(&ext) || is_video_tool(tool_id) {
+            if let Some(frame) = extract_video_frame_rgba(p, (duration * 0.2).min(0.8), 240, 134) {
+                let dims = (frame.width().max(64) * 4, frame.height().max(36) * 4);
+                let mut strip = extract_video_filmstrip(p, duration, 7, 50, 34);
+                if strip.is_empty() {
+                    let tile = imageops::resize(&frame, 50, 34, imageops::FilterType::Triangle);
+                    strip = vec![tile; 7];
+                }
+                return (frame, dims, duration, strip);
+            }
+        }
+        if let Ok(img) = image::open(p) {
+            let rgba = img.to_rgba8();
+            let dims = (rgba.width().max(1), rgba.height().max(1));
+            let thumb = imageops::resize(&rgba, 220, 168, imageops::FilterType::Triangle);
+            return (thumb, dims, duration, Vec::new());
+        }
+    }
+    let fallback = sample_photo(220, 136);
+    let tile = imageops::resize(&fallback, 50, 34, imageops::FilterType::Triangle);
+    (fallback, (1280, 720), duration, vec![tile; 7])
+}
+
+fn default_controls(tool_id: &str, duration: f32) -> (Vec<Slider>, Vec<&'static str>) {
+    let dur = duration.max(1.0);
     let s = |label, min, max, val, bipolar, unit| Slider { label, min, max, val, bipolar, unit };
     match tool_id {
         "editImage" => (
@@ -186,15 +224,24 @@ fn default_controls(tool_id: &str) -> (Vec<Slider>, Vec<&'static str>) {
         ),
         "cropImage" | "cropVideo" => (
             vec![
-                s("Crop Width", 30.0, 100.0, 82.0, false, "%"),
-                s("Crop Height", 30.0, 100.0, 82.0, false, "%"),
+                s("Crop Width", 25.0, 100.0, 82.0, false, "%"),
+                s("Crop Height", 25.0, 100.0, 82.0, false, "%"),
             ],
             vec!["Free", "1:1", "16:9", "9:16", "4:3"],
         ),
-        "redactImage" | "redactVideo" => (
+        "redactImage" => (
             vec![
-                s("Box Width", 20.0, 85.0, 48.0, false, "%"),
+                s("Box Width", 15.0, 85.0, 48.0, false, "%"),
                 s("Box Height", 15.0, 75.0, 34.0, false, "%"),
+            ],
+            vec!["Blur", "Solid Black"],
+        ),
+        "redactVideo" => (
+            vec![
+                s("Box Width", 15.0, 85.0, 48.0, false, "%"),
+                s("Box Height", 15.0, 75.0, 34.0, false, "%"),
+                s("Start Time", 0.0, (dur - 0.2).max(0.5), 0.0, false, " s"),
+                s("End Time", 0.2, dur, dur, false, " s"),
             ],
             vec!["Blur", "Solid Black"],
         ),
@@ -212,28 +259,59 @@ fn default_controls(tool_id: &str) -> (Vec<Slider>, Vec<&'static str>) {
             ],
             vec!["Grid", "Row", "Column"],
         ),
-        "trimAudio" | "trimVideo" | "redactAudio" | "splitVideo" => (
+        "trimVideo" => (
             vec![
-                s("Start Time", 0.0, 20.0, 2.5, false, " s"),
-                s("End Time", 5.0, 60.0, 38.0, false, " s"),
+                s("Start Time", 0.0, (dur - 0.2).max(0.5), (dur * 0.1).min(1.0), false, " s"),
+                s("End Time", 0.2, dur, (dur * 0.9).max(0.4), false, " s"),
             ],
-            vec!["Keep Pauses", "Trim Silence"],
+            vec!["Full Range", "Middle 50%", "First Half"],
+        ),
+        "trimAudio" => (
+            vec![
+                s("Start Time", 0.0, (dur - 0.2).max(0.5), (dur * 0.08).min(0.8), false, " s"),
+                s("End Time", 0.2, dur, (dur * 0.92).max(0.4), false, " s"),
+            ],
+            vec!["Keep All Audio", "Trim Silent Ends"],
+        ),
+        "redactAudio" => (
+            vec![
+                s("Mute Start", 0.0, (dur - 0.2).max(0.5), dur * 0.25, false, " s"),
+                s("Mute End", 0.2, dur, dur * 0.65, false, " s"),
+            ],
+            vec!["Mute Selected Range", "Mute First 25%"],
+        ),
+        "splitVideo" => (
+            vec![s("Split Point", 0.2, (dur - 0.2).max(0.5), dur * 0.5, false, " s")],
+            vec!["Split at Cursor", "2 Equal Clips", "3 Equal Clips", "4 Equal Clips"],
+        ),
+        "videoSnapshots" => (
+            vec![s("Frame Time", 0.0, dur, dur * 0.35, false, " s")],
+            vec!["Single Frame", "3 Keyframes", "5 Frames"],
         ),
         "changeVideoSpeed" => (
             vec![s("Playback Speed", 0.25, 4.0, 2.0, false, "x")],
-            vec!["0.5x", "1.25x", "1.5x", "2.0x"],
+            vec!["0.5x", "1.0x", "1.5x", "2.0x", "4.0x"],
         ),
         "audioChannels" => (
             vec![
-                s("Left Channel", 0.0, 100.0, 100.0, false, "%"),
-                s("Right Channel", 0.0, 100.0, 100.0, false, "%"),
+                s("Left Volume", 0.0, 100.0, 100.0, false, "%"),
+                s("Right Volume", 0.0, 100.0, 100.0, false, "%"),
             ],
             vec!["Mono", "Stereo"],
         ),
-        "normalizeAudio" | "audioToVideo" | "videoSnapshots" | "joinVideos" => (
-            vec![s("Target Level", 40.0, 100.0, 85.0, false, "%")],
-            vec!["16:9", "9:16", "1:1"],
+        "normalizeAudio" => (
+            vec![
+                s("Target Loudness", -24.0, -8.0, -16.0, false, " LUFS"),
+                s("Loudness Range", 1.0, 20.0, 11.0, false, " LU"),
+                s("True Peak", -6.0, 0.0, -1.5, false, " dBTP"),
+            ],
+            vec!["Podcast (-16)", "Broadcast (-23)", "Streaming (-14)"],
         ),
+        "audioToVideo" => (
+            vec![s("Wave Scale", 40.0, 100.0, 85.0, false, "%")],
+            vec!["16:9 Wave", "9:16 Wave", "1:1 Wave", "16:9 Bars", "9:16 Bars"],
+        ),
+        "joinVideos" => (vec![], vec!["Keep Order", "Reverse Order"]),
         "organizePDF" | "mergePDF" => (
             vec![],
             vec!["Reverse Order", "Keep Order", "First Page"],
@@ -248,15 +326,20 @@ fn default_controls(tool_id: &str) -> (Vec<Slider>, Vec<&'static str>) {
 impl ModalState {
     fn new(tool_id: &str, paths: Vec<PathBuf>) -> Self {
         let title = tool_meta(tool_id).map(|m| m.name.to_string()).unwrap_or_else(|| tool_id.to_string());
-        let thumb = load_thumb(&paths);
-        let (sliders, pills) = default_controls(tool_id);
+        let (thumb, source_dims, duration, filmstrip) = load_media_assets(tool_id, &paths);
+        let (sliders, pills) = default_controls(tool_id, duration);
+        let active_pill = if tool_id == "changeVideoSpeed" { 3 } else { 0 };
         Self {
             tool_id: tool_id.to_string(),
             title,
+            paths,
+            source_dims,
+            duration,
             thumb,
+            filmstrip,
             sliders,
             pills,
-            active_pill: 0,
+            active_pill,
             active_swatch: 0,
             dragging_slider: None,
             applied: None,
@@ -265,9 +348,81 @@ impl ModalState {
         }
     }
 
+    fn on_pill_clicked(&mut self, pill_idx: usize) {
+        self.active_pill = pill_idx;
+        let dur = self.duration.max(1.0);
+        match self.tool_id.as_str() {
+            "changeVideoSpeed" => {
+                let spd = match pill_idx {
+                    0 => 0.5,
+                    1 => 1.0,
+                    2 => 1.5,
+                    3 => 2.0,
+                    _ => 4.0,
+                };
+                if let Some(s) = self.sliders.first_mut() {
+                    s.val = spd;
+                }
+            }
+            "normalizeAudio" => {
+                let (lufs, lra, tp) = match pill_idx {
+                    1 => (-23.0, 7.0, -1.0),
+                    2 => (-14.0, 9.0, -1.0),
+                    _ => (-16.0, 11.0, -1.5),
+                };
+                if self.sliders.len() >= 3 {
+                    self.sliders[0].val = lufs;
+                    self.sliders[1].val = lra;
+                    self.sliders[2].val = tp;
+                }
+            }
+            "cropImage" | "cropVideo" if self.sliders.len() >= 2 => {
+                let (w_pct, h_pct) = match pill_idx {
+                    1 => (75.0, 75.0),
+                    2 => (90.0, 52.0),
+                    3 => (52.0, 90.0),
+                    4 => (84.0, 63.0),
+                    _ => (82.0, 82.0),
+                };
+                self.sliders[0].val = w_pct;
+                self.sliders[1].val = h_pct;
+            }
+            "trimVideo" if self.sliders.len() >= 2 => {
+                let (s0, s1) = match pill_idx {
+                    1 => (dur * 0.25, dur * 0.75),
+                    2 => (0.0, dur * 0.5),
+                    _ => (0.0, dur),
+                };
+                self.sliders[0].val = s0;
+                self.sliders[1].val = s1;
+            }
+            "redactAudio" if self.sliders.len() >= 2 && pill_idx == 1 => {
+                self.sliders[0].val = 0.0;
+                self.sliders[1].val = (dur * 0.25).max(0.2);
+            }
+            "createCollage" if !self.sliders.is_empty() => {
+                self.sliders[0].val = match pill_idx {
+                    1 => 4.0,
+                    2 => 1.0,
+                    _ => 2.0,
+                };
+            }
+            _ => {}
+        }
+    }
+
+    fn refresh_video_frame_at(&mut self, time_sec: f32) {
+        if let Some(p) = self.paths.first() {
+            if let Some(fr) = extract_video_frame_rgba(p, time_sec, 240, 134) {
+                self.thumb = fr;
+            }
+        }
+    }
+
     fn build_params(&self) -> ToolParams {
         let mut p = ToolParams::default();
         let val = |i: usize, def: f32| self.sliders.get(i).map(|s| s.val).unwrap_or(def);
+        let dur = self.duration.max(0.5);
         match self.tool_id.as_str() {
             "editImage" => {
                 p.exposure = val(0, 0.0);
@@ -288,13 +443,26 @@ impl ModalState {
                 p.scale_pct = val(1, 100.0).round() as u8;
             }
             "cropImage" | "cropVideo" => {
-                let (w, h) = (self.thumb.width(), self.thumb.height());
-                let cw = ((w as f32 * val(0, 82.0) / 100.0).round() as u32).max(8);
-                let ch = ((h as f32 * val(1, 82.0) / 100.0).round() as u32).max(8);
-                p.crop_rect = Some(((w - cw) / 2, (h - ch) / 2, cw, ch));
+                let (w, h) = self.source_dims;
+                let cw = (((w as f32 * val(0, 82.0) / 100.0).round() as u32) & !1).max(8);
+                let ch = (((h as f32 * val(1, 82.0) / 100.0).round() as u32) & !1).max(8);
+                p.crop_rect = Some(((w.saturating_sub(cw)) / 2, (h.saturating_sub(ch)) / 2, cw, ch));
             }
-            "redactImage" | "redactVideo" => {
+            "redactImage" => {
                 p.redact_solid = self.active_pill == 1;
+                let (w, h) = self.source_dims;
+                let rw = ((w as f32 * val(0, 48.0) / 100.0).round() as u32).max(8);
+                let rh = ((h as f32 * val(1, 34.0) / 100.0).round() as u32).max(8);
+                p.crop_rect = Some(((w.saturating_sub(rw)) / 2, (h.saturating_sub(rh)) / 2, rw, rh));
+            }
+            "redactVideo" => {
+                p.redact_solid = self.active_pill == 1;
+                let (w, h) = self.source_dims;
+                let rw = ((w as f32 * val(0, 48.0) / 100.0).round() as u32).max(8);
+                let rh = ((h as f32 * val(1, 34.0) / 100.0).round() as u32).max(8);
+                p.crop_rect = Some(((w.saturating_sub(rw)) / 2, (h.saturating_sub(rh)) / 2, rw, rh));
+                p.start_sec = val(2, 0.0);
+                p.end_sec = Some(val(3, dur).max(p.start_sec + 0.1));
             }
             "annotateImage" => {
                 p.annotation_color = match self.active_pill {
@@ -308,18 +476,70 @@ impl ModalState {
                 p.collage_cols = val(0, 2.0).round().clamp(1.0, 4.0) as u32;
                 p.corner_radius = val(1, 18.0).round() as u32;
             }
-            "trimAudio" | "trimVideo" | "redactAudio" | "splitVideo" => {
-                p.start_sec = val(0, 2.5);
-                p.end_sec = Some(val(1, 38.0).max(p.start_sec + 1.0));
+            "trimVideo" | "redactAudio" => {
+                p.start_sec = val(0, 0.0);
+                p.end_sec = Some(val(1, dur).max(p.start_sec + 0.1));
+            }
+            "trimAudio" => {
+                p.start_sec = val(0, 0.0);
+                p.end_sec = Some(val(1, dur).max(p.start_sec + 0.1));
+                p.trim_silence = self.active_pill == 1;
+            }
+            "splitVideo" => {
+                let pt = val(0, dur * 0.5).clamp(0.1, (dur - 0.1).max(0.2));
+                p.split_points = match self.active_pill {
+                    1 => vec![dur * 0.5],
+                    2 => vec![dur / 3.0, dur * 2.0 / 3.0],
+                    3 => vec![dur * 0.25, dur * 0.5, dur * 0.75],
+                    _ => vec![pt],
+                };
+                p.end_sec = Some(pt);
+            }
+            "videoSnapshots" => {
+                let t0 = val(0, dur * 0.35).clamp(0.0, dur);
+                p.start_sec = t0;
+                p.snapshot_times = match self.active_pill {
+                    1 => vec![dur * 0.15, dur * 0.5, dur * 0.85],
+                    2 => (0..5).map(|i| dur * (i as f32 + 0.5) / 5.0).collect(),
+                    _ => vec![t0],
+                };
             }
             "changeVideoSpeed" => {
-                p.speed_factor = val(0, 2.0);
+                p.speed_factor = val(0, 2.0).clamp(0.25, 4.0);
             }
             "audioChannels" => {
                 p.mono = self.active_pill == 0;
+                p.left_gain = (val(0, 100.0) / 100.0).clamp(0.0, 1.0);
+                p.right_gain = (val(1, 100.0) / 100.0).clamp(0.0, 1.0);
             }
-            "organizePDF" => {
-                p.page_order = if self.active_pill == 2 { vec![0] } else { vec![] };
+            "normalizeAudio" => {
+                p.target_lufs = val(0, -16.0).clamp(-24.0, -8.0);
+                p.loudness_range = val(1, 11.0).clamp(1.0, 20.0);
+                p.true_peak = val(2, -1.5).clamp(-6.0, 0.0);
+            }
+            "audioToVideo" => {
+                p.visualizer_shape = match self.active_pill {
+                    1 | 4 => 1,
+                    2 => 2,
+                    _ => 0,
+                };
+                p.visualizer_bars = self.active_pill >= 3;
+            }
+            "joinVideos" => {
+                let n = self.paths.len().max(2);
+                p.page_order = if self.active_pill == 1 {
+                    (0..n).rev().collect()
+                } else {
+                    (0..n).collect()
+                };
+            }
+            "organizePDF" | "mergePDF" => {
+                let n = self.paths.len().max(3);
+                p.page_order = match self.active_pill {
+                    1 => (0..n).collect(),
+                    2 => vec![0],
+                    _ => vec![],
+                };
             }
             _ => {}
         }
@@ -346,11 +566,50 @@ fn blit_rgba(buf: &mut [Px], img: &RgbaImage, ox: i32, oy: i32, r_corner: f64) {
     }
 }
 
+fn draw_filmstrip_timeline(
+    buf: &mut [Px],
+    strip: &[RgbaImage],
+    cy: f64,
+    s_norm: f32,
+    e_norm: f32,
+    splits: &[f32],
+    dur: f32,
+) {
+    let orange = c8(255, 82, 0);
+    fill_rrect(buf, 230.0, cy, 186.0, 22.0, 8.0, c8(28, 22, 18), 0.92);
+    let n = strip.len().max(1);
+    for (i, tile) in strip.iter().enumerate() {
+        let tx = 50 + (i * 356 / n) as i32;
+        blit_rgba(buf, tile, tx, cy as i32 - 17, 4.0);
+    }
+    let lx = 50.0 + (s_norm.clamp(0.0, 0.95) as f64) * 360.0;
+    let rx = 50.0 + (e_norm.clamp(s_norm + 0.05, 1.0) as f64) * 360.0;
+    if lx > 52.0 {
+        fill_rrect(buf, (50.0 + lx) * 0.5, cy, (lx - 50.0) * 0.5, 19.0, 4.0, c8(12, 10, 8), 0.68);
+    }
+    if rx < 408.0 {
+        fill_rrect(buf, (rx + 410.0) * 0.5, cy, (410.0 - rx) * 0.5, 19.0, 4.0, c8(12, 10, 8), 0.68);
+    }
+    let bw = ((rx - lx) * 0.5).max(6.0);
+    stroke_rrect(buf, (lx + rx) * 0.5, cy, bw, 19.0, 6.0, 2.4, orange, 1.0);
+    fill_rrect(buf, lx, cy, 4.5, 20.0, 3.0, orange, 1.0);
+    fill_rrect(buf, rx, cy, 4.5, 20.0, 3.0, orange, 1.0);
+    fill_rrect(buf, lx, cy, 1.2, 8.0, 1.0, [1.0; 3], 0.95);
+    fill_rrect(buf, rx, cy, 1.2, 8.0, 1.0, [1.0; 3], 0.95);
+
+    for &sp in splits {
+        let sn = (sp / dur.max(0.5)).clamp(0.05, 0.95) as f64;
+        let sx = 50.0 + sn * 360.0;
+        fill_rrect(buf, sx, cy, 1.8, 22.0, 1.5, orange, 1.0);
+        fill_disc(buf, sx, cy - 20.0, 6.0, orange, 1.0);
+    }
+}
+
 fn render_modal(st: &ModalState) -> Vec<u32> {
     let mut buf = vec![[0f32; 4]; TW * TH];
     let orange = c8(255, 82, 0);
 
-    // 1. Warm frosted glass card surface (matching Tangerine press screenshots)
+    // 1. Warm frosted glass card surface
     for y in 0..TH {
         let v = y as f32 / (TH - 1) as f32;
         for x in 0..TW {
@@ -385,28 +644,166 @@ fn render_modal(st: &ModalState) -> Vec<u32> {
     blit_mask_sized(&mut buf, TW, TH, &fit_mask(&st.title, 15, 700, 280), TW as f64 * 0.5, 24.0, c8(42, 30, 20));
     fill_rrect(&mut buf, TW as f64 * 0.5, 46.0, TW as f64 * 0.5 - 4.0, 0.5, 0.0, c8(60, 40, 20), 0.12);
 
-    // 3. Live Preview Area (y = 58..258)
+    // 3. Live Preview Area (y = 56..260)
     let params = st.build_params();
+    let dur = st.duration.max(0.5);
     match st.tool_id.as_str() {
-        "trimAudio" | "trimVideo" | "redactAudio" | "normalizeAudio" | "audioChannels"
-        | "audioToVideo" | "changeVideoSpeed" | "splitVideo" | "videoSnapshots" | "joinVideos" => {
-            fill_rrect(&mut buf, 230.0, 158.0, 202.0, 92.0, 14.0, c8(255, 234, 208), 0.52);
-            stroke_rrect(&mut buf, 230.0, 158.0, 190.0, 62.0, 8.0, 2.0, orange, 0.90);
-            let s_norm = (st.sliders.first().map(|s| (s.val - s.min) / (s.max - s.min)).unwrap_or(0.08)).clamp(0.0, 0.85);
-            let e_norm = (st.sliders.get(1).map(|s| (s.val - s.min) / (s.max - s.min)).unwrap_or(0.88)).clamp(s_norm + 0.1, 1.0);
+        "trimVideo" | "splitVideo" | "videoSnapshots" => {
+            // Real 16:9 video monitor on top + 7-tile filmstrip timeline below
+            fill_rrect(&mut buf, 230.0, 122.0, 198.0, 66.0, 12.0, c8(16, 14, 13), 0.95);
+            let vframe = imageops::resize(&st.thumb, 216, 120, imageops::FilterType::Triangle);
+            blit_rgba(&mut buf, &vframe, 230 - 108, 122 - 60, 6.0);
+
+            // Timecode pill in top-right of video monitor
+            fill_rrect(&mut buf, 372.0, 74.0, 46.0, 11.0, 6.0, c8(16, 14, 13), 0.78);
+            let tc = if st.tool_id == "trimVideo" {
+                format!("{:.1}s - {:.1}s", params.start_sec, params.end_sec.unwrap_or(dur))
+            } else if st.tool_id == "splitVideo" {
+                format!("{} clips", params.split_points.len() + 1)
+            } else {
+                format!("{} PNGs", params.snapshot_times.len().max(1))
+            };
+            blit_mask_sized(&mut buf, TW, TH, &fit_mask(&tc, 10, 700, 84), 372.0, 74.0, [1.0; 3]);
+
+            let (s_norm, e_norm) = if st.tool_id == "trimVideo" {
+                (
+                    (params.start_sec / dur).clamp(0.0, 0.9),
+                    (params.end_sec.unwrap_or(dur) / dur).clamp(0.1, 1.0),
+                )
+            } else {
+                (0.0, 1.0)
+            };
+            let markers: &[f32] = if st.tool_id == "splitVideo" {
+                &params.split_points
+            } else if st.tool_id == "videoSnapshots" {
+                &params.snapshot_times
+            } else {
+                &[]
+            };
+            draw_filmstrip_timeline(&mut buf, &st.filmstrip, 224.0, s_norm, e_norm, markers, dur);
+        }
+        "changeVideoSpeed" => {
+            fill_rrect(&mut buf, 230.0, 152.0, 200.0, 92.0, 14.0, c8(16, 14, 13), 0.95);
+            let vframe = imageops::resize(&st.thumb, 244, 138, imageops::FilterType::Triangle);
+            blit_rgba(&mut buf, &vframe, 230 - 122, 142 - 69, 8.0);
+            let out_dur = dur / params.speed_factor.max(0.25);
+            fill_rrect(&mut buf, 230.0, 226.0, 104.0, 13.0, 7.0, orange, 0.94);
+            blit_mask_sized(
+                &mut buf,
+                TW,
+                TH,
+                &fit_mask(&format!("Speed {:.2}x · Output {:.1}s", params.speed_factor, out_dur), 11, 700, 196),
+                230.0,
+                226.0,
+                [1.0; 3],
+            );
+        }
+        "trimAudio" | "redactAudio" => {
+            fill_rrect(&mut buf, 230.0, 148.0, 202.0, 84.0, 14.0, c8(255, 234, 208), 0.56);
+            let s_norm = (params.start_sec / dur).clamp(0.0, 0.88);
+            let e_norm = (params.end_sec.unwrap_or(dur) / dur).clamp(s_norm + 0.08, 1.0);
             for i in 0..46 {
                 let t = i as f32 / 45.0;
                 let bx = 52.0 + t as f64 * 356.0;
-                let h = 10.0 + ((i as f32 * 0.65).sin().abs() * (i as f32 * 0.19).cos().abs()) as f64 * 42.0;
-                let active = t >= s_norm && t <= e_norm;
-                fill_rrect(&mut buf, bx, 158.0, 2.0, h, 2.0, if active { orange } else { c8(150, 118, 96) }, if active { 0.92 } else { 0.42 });
+                let h = 10.0 + ((i as f32 * 0.65).sin().abs() * (i as f32 * 0.19).cos().abs()) as f64 * 40.0;
+                let in_range = t >= s_norm && t <= e_norm;
+                let active = if st.tool_id == "redactAudio" { !in_range } else { in_range };
+                let col = if st.tool_id == "redactAudio" && in_range {
+                    c8(220, 48, 48)
+                } else if active {
+                    orange
+                } else {
+                    c8(150, 118, 96)
+                };
+                fill_rrect(&mut buf, bx, 144.0, 2.0, h, 2.0, col, if active || in_range { 0.92 } else { 0.38 });
             }
-            let lx = 48.0 + s_norm as f64 * 364.0;
-            let rx = 48.0 + e_norm as f64 * 364.0;
-            fill_rrect(&mut buf, lx, 158.0, 5.0, 62.0, 4.0, orange, 1.0);
-            fill_rrect(&mut buf, rx, 158.0, 5.0, 62.0, 4.0, orange, 1.0);
-            blit_mask_sized(&mut buf, TW, TH, &fit_mask(&format!("Start {:.1}s", params.start_sec), 11, 600, 120), 86.0, 234.0, c8(72, 48, 30));
-            blit_mask_sized(&mut buf, TW, TH, &fit_mask(&format!("End {:.1}s", params.end_sec.unwrap_or(38.0)), 11, 600, 120), 374.0, 234.0, c8(72, 48, 30));
+            let lx = 52.0 + s_norm as f64 * 356.0;
+            let rx = 52.0 + e_norm as f64 * 356.0;
+            stroke_rrect(&mut buf, (lx + rx) * 0.5, 144.0, ((rx - lx) * 0.5).max(6.0), 54.0, 8.0, 2.0, orange, 0.92);
+            fill_rrect(&mut buf, lx, 144.0, 4.5, 56.0, 3.5, orange, 1.0);
+            fill_rrect(&mut buf, rx, 144.0, 4.5, 56.0, 3.5, orange, 1.0);
+            let status = if st.tool_id == "trimAudio" && params.trim_silence {
+                format!("Start {:.1}s · End {:.1}s · Auto-trim silent ends ON", params.start_sec, params.end_sec.unwrap_or(dur))
+            } else if st.tool_id == "redactAudio" {
+                format!("Muting {:.1}s to {:.1}s", params.start_sec, params.end_sec.unwrap_or(dur))
+            } else {
+                format!("Keep {:.1}s to {:.1}s (Duration {:.1}s)", params.start_sec, params.end_sec.unwrap_or(dur), dur)
+            };
+            blit_mask_sized(&mut buf, TW, TH, &fit_mask(&status, 11, 600, 360), 230.0, 216.0, c8(72, 48, 30));
+        }
+        "normalizeAudio" => {
+            fill_rrect(&mut buf, 230.0, 148.0, 202.0, 84.0, 14.0, c8(255, 234, 208), 0.56);
+            let boost = ((params.target_lufs + 24.0) / 16.0).clamp(0.35, 1.25) as f64;
+            let ceil_y = 148.0 - 44.0 * boost.min(1.05);
+            fill_rrect(&mut buf, 230.0, ceil_y, 186.0, 1.0, 0.5, orange, 0.75);
+            for i in 0..46 {
+                let bx = 52.0 + (i as f64 / 45.0) * 356.0;
+                let h = (8.0 + ((i as f32 * 0.62).sin().abs() * 34.0) as f64 * boost).min(52.0);
+                fill_rrect(&mut buf, bx, 148.0, 2.2, h, 2.0, orange, 0.90);
+            }
+            blit_mask_sized(
+                &mut buf,
+                TW,
+                TH,
+                &fit_mask(&format!("Target {:.1} LUFS · LRA {:.1} LU · TP {:.1} dBTP", params.target_lufs, params.loudness_range, params.true_peak), 11, 600, 360),
+                230.0,
+                216.0,
+                c8(72, 48, 30),
+            );
+        }
+        "audioChannels" => {
+            fill_rrect(&mut buf, 230.0, 152.0, 202.0, 88.0, 14.0, c8(255, 234, 208), 0.56);
+            blit_mask_sized(&mut buf, TW, TH, &fit_mask("L", 12, 700, 24), 48.0, 120.0, c8(68, 44, 28));
+            blit_mask_sized(&mut buf, TW, TH, &fit_mask("R", 12, 700, 24), 48.0, 178.0, c8(68, 44, 28));
+            for i in 0..42 {
+                let bx = 68.0 + (i as f64 / 41.0) * 336.0;
+                let base = 6.0 + ((i as f32 * 0.58).sin().abs() * 18.0) as f64;
+                let lh = (base * params.left_gain as f64).max(2.0);
+                let rh = (base * params.right_gain as f64).max(2.0);
+                fill_rrect(&mut buf, bx, 120.0, 2.0, lh, 2.0, orange, 0.92);
+                fill_rrect(&mut buf, bx, 178.0, 2.0, rh, 2.0, if params.mono { orange } else { c8(218, 96, 28) }, 0.92);
+            }
+            let mode_lbl = if params.mono { "Mono Mixdown (1 ch)" } else { "Stereo Split (2 ch)" };
+            blit_mask_sized(&mut buf, TW, TH, &fit_mask(mode_lbl, 11, 600, 260), 230.0, 222.0, c8(72, 48, 30));
+        }
+        "audioToVideo" => {
+            let (cw, ch) = match params.visualizer_shape {
+                1 => (58.0, 92.0),
+                2 => (88.0, 88.0),
+                _ => (162.0, 88.0),
+            };
+            fill_rrect(&mut buf, 230.0, 152.0, cw, ch, 12.0, c8(16, 14, 13), 0.96);
+            stroke_rrect(&mut buf, 230.0, 152.0, cw, ch, 12.0, 1.5, orange, 0.65);
+            let scale = (st.sliders.first().map(|s| s.val).unwrap_or(85.0) / 100.0) as f64;
+            let bars = 24;
+            for i in 0..bars {
+                let u = i as f64 / (bars - 1) as f64;
+                let bx = 230.0 - (cw - 18.0) + u * (cw - 18.0) * 2.0;
+                let h = (6.0 + ((i as f32 * 0.7).sin().abs() * 36.0) as f64 * scale).min(ch - 14.0);
+                let w = if params.visualizer_bars { 2.8 } else { 1.4 };
+                fill_rrect(&mut buf, bx, 152.0, w, h, 1.5, orange, 0.95);
+            }
+        }
+        "joinVideos" => {
+            fill_rrect(&mut buf, 230.0, 158.0, 202.0, 94.0, 14.0, c8(255, 245, 235), 0.62);
+            let mut names: Vec<String> = st
+                .paths
+                .iter()
+                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .collect();
+            if names.is_empty() {
+                names = vec!["clip_01.mp4".into(), "clip_02.mp4".into(), "clip_03.mp4".into()];
+            }
+            if st.active_pill == 1 {
+                names.reverse();
+            }
+            for (i, name) in names.iter().take(4).enumerate() {
+                let ry = 94.0 + i as f64 * 40.0;
+                fill_rrect(&mut buf, 230.0, ry, 182.0, 16.0, 8.0, [1.0; 3], 0.92);
+                fill_disc(&mut buf, 68.0, ry, 10.0, orange, 1.0);
+                blit_mask_sized(&mut buf, TW, TH, &fit_mask(&(i + 1).to_string(), 11, 700, 20), 68.0, ry, [1.0; 3]);
+                blit_mask_sized(&mut buf, TW, TH, &fit_mask(name, 12, 600, 260), 218.0, ry, c8(42, 34, 28));
+            }
         }
         "removeMetadata" => {
             fill_rrect(&mut buf, 230.0, 158.0, 202.0, 94.0, 14.0, [1.0; 3], 0.78);
@@ -428,7 +825,11 @@ fn render_modal(st: &ModalState) -> Vec<u32> {
         }
         "organizePDF" | "mergePDF" => {
             fill_rrect(&mut buf, 230.0, 158.0, 202.0, 94.0, 14.0, c8(255, 245, 235), 0.55);
-            let order = if st.active_pill == 0 { [2, 1, 3] } else { [1, 2, 3] };
+            let order: &[usize] = match st.active_pill {
+                1 => &[1, 2, 3],
+                2 => &[1],
+                _ => &[3, 2, 1],
+            };
             for (i, pg) in order.iter().enumerate() {
                 let px = 114.0 + i as f64 * 116.0;
                 fill_rrect(&mut buf, px, 158.0, 44.0, 62.0, 8.0, [1.0; 3], 0.95);
@@ -464,9 +865,11 @@ fn render_modal(st: &ModalState) -> Vec<u32> {
                     fill_rrect(&mut buf, 230.0 + dx, 158.0 + dy, 4.5, 4.5, 2.0, orange, 1.0);
                 }
             } else if st.tool_id == "redactImage" || st.tool_id == "redactVideo" {
+                let rw = preview.width() as f64 * (st.sliders.first().map(|s| s.val).unwrap_or(48.0) as f64 / 100.0) * 0.5;
+                let rh = preview.height() as f64 * (st.sliders.get(1).map(|s| s.val).unwrap_or(34.0) as f64 / 100.0) * 0.5;
                 let col = if st.active_pill == 1 { c8(8, 8, 8) } else { c8(90, 110, 120) };
-                fill_rrect(&mut buf, 230.0, 152.0, 52.0, 26.0, 4.0, col, 0.94);
-                stroke_rrect(&mut buf, 230.0, 152.0, 52.0, 26.0, 4.0, 2.2, orange, 1.0);
+                fill_rrect(&mut buf, 230.0, 156.0, rw, rh, 4.0, col, 0.94);
+                stroke_rrect(&mut buf, 230.0, 156.0, rw, rh, 4.0, 2.2, orange, 1.0);
             } else if st.tool_id == "annotateImage" {
                 let ac = c8(params.annotation_color[0], params.annotation_color[1], params.annotation_color[2]);
                 stroke_rrect(&mut buf, 230.0, 152.0, 56.0, 34.0, 6.0, 3.0, ac, 1.0);
@@ -511,8 +914,12 @@ fn render_modal(st: &ModalState) -> Vec<u32> {
         }
         fill_disc(&mut buf, thumb_x, sy + 1.5, 8.5, c8(40, 30, 20), 0.18);
         fill_disc(&mut buf, thumb_x, sy, 8.0, [1.0; 3], 1.0);
-        let v_str = if s.unit == " EV" || s.unit == "x" {
+        let v_str = if s.unit == " EV" {
             format!("{:+.2}{}", s.val, s.unit)
+        } else if s.unit == "x" {
+            format!("{:.2}{}", s.val, s.unit)
+        } else if s.unit == " s" || s.unit == " LUFS" || s.unit == " dBTP" || s.unit == " LU" {
+            format!("{:.1}{}", s.val, s.unit)
         } else if s.bipolar {
             format!("{:+.0}{}", s.val, s.unit)
         } else {
@@ -525,13 +932,13 @@ fn render_modal(st: &ModalState) -> Vec<u32> {
     if !st.pills.is_empty() {
         let py = (y_cursor + st.sliders.len() as f64 * 32.0 + 10.0).min(458.0);
         let n = st.pills.len() as f64;
-        let pw = (360.0 / n).min(108.0);
+        let pw = (380.0 / n).min(118.0);
         let start_x = 230.0 - (pw * n) * 0.5 + pw * 0.5;
         for (i, label) in st.pills.iter().enumerate() {
             let px = start_x + i as f64 * pw;
             let active = i == st.active_pill;
-            fill_rrect(&mut buf, px, py, pw * 0.5 - 4.0, 14.0, 8.0, if active { c8(148, 92, 58) } else { [1.0; 3] }, if active { 0.85 } else { 0.38 });
-            blit_mask_sized(&mut buf, TW, TH, &fit_mask(label, 11, 600, pw as usize - 12), px, py, if active { [1.0; 3] } else { c8(58, 42, 30) });
+            fill_rrect(&mut buf, px, py, pw * 0.5 - 3.5, 14.0, 8.0, if active { c8(148, 92, 58) } else { [1.0; 3] }, if active { 0.88 } else { 0.38 });
+            blit_mask_sized(&mut buf, TW, TH, &fit_mask(label, 11, 600, pw as usize - 10), px, py, if active { [1.0; 3] } else { c8(58, 42, 30) });
         }
     }
 
@@ -617,7 +1024,7 @@ unsafe extern "system" fn modal_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM)
             if (26..=102).contains(&mx) && (494..=526).contains(&my) {
                 MODAL.with(|c| {
                     if let Some(st) = c.borrow_mut().as_mut() {
-                        let (sliders, pills) = default_controls(&st.tool_id);
+                        let (sliders, pills) = default_controls(&st.tool_id, st.duration);
                         st.sliders = sliders;
                         st.pills = pills;
                         st.active_pill = 0;
@@ -627,11 +1034,23 @@ unsafe extern "system" fn modal_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM)
                 present_modal(hwnd);
                 return 0;
             }
-            // 4. Swatches / Sliders / Pills
+            // 4. Direct timeline scrubbing on filmstrip / waveform (y = 196..252, x = 50..410)
             let mut changed = false;
             MODAL.with(|c| {
                 let mut g = c.borrow_mut();
                 let Some(st) = g.as_mut() else { return };
+                if matches!(st.tool_id.as_str(), "trimVideo" | "splitVideo" | "videoSnapshots")
+                    && (198..=248).contains(&my)
+                    && (50..=410).contains(&mx)
+                {
+                    let norm = ((mx - 50) as f32 / 360.0).clamp(0.0, 1.0);
+                    let target_idx = if st.sliders.len() >= 2 && norm > 0.55 { 1 } else { 0 };
+                    if let Some(sl) = st.sliders.get_mut(target_idx) {
+                        sl.val = sl.min + (sl.max - sl.min) * norm;
+                    }
+                    changed = true;
+                    return;
+                }
                 let mut y_cur = 282;
                 if st.tool_id == "frameImage" {
                     if (y_cur - 14..=y_cur + 14).contains(&my) {
@@ -659,13 +1078,13 @@ unsafe extern "system" fn modal_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM)
                     let py = (y_cur + st.sliders.len() as i32 * 32 + 10).min(458);
                     if (py - 16..=py + 16).contains(&my) {
                         let n = st.pills.len() as f64;
-                        let pw = (360.0 / n).min(108.0);
+                        let pw = (380.0 / n).min(118.0);
                         let start_x = 230.0 - (pw * n) * 0.5 + pw * 0.5;
                         for i in 0..st.pills.len() {
                             let px = (start_x + i as f64 * pw) as i32;
                             let hw = (pw * 0.5) as i32;
                             if (px - hw..=px + hw).contains(&mx) {
-                                st.active_pill = i;
+                                st.on_pill_clicked(i);
                                 changed = true;
                             }
                         }
@@ -697,13 +1116,24 @@ unsafe extern "system" fn modal_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM)
             0
         }
         WM_LBUTTONUP => {
+            let mut need_redraw = false;
             MODAL.with(|c| {
                 if let Some(st) = c.borrow_mut().as_mut() {
-                    if st.dragging_slider.take().is_some() {
+                    if let Some(idx) = st.dragging_slider.take() {
                         ReleaseCapture();
+                        if matches!(st.tool_id.as_str(), "trimVideo" | "splitVideo" | "videoSnapshots") {
+                            if let Some(sl) = st.sliders.get(idx) {
+                                let t = sl.val;
+                                st.refresh_video_frame_at(t);
+                                need_redraw = true;
+                            }
+                        }
                     }
                 }
             });
+            if need_redraw {
+                present_modal(hwnd);
+            }
             0
         }
         WM_KEYDOWN if wp == VK_ESCAPE as usize => {
@@ -808,4 +1238,45 @@ pub fn run_modal(tool_id: &str, paths: Vec<PathBuf>, auto_apply_ms: Option<u32>)
         }
     }
     MODAL.with(|c| c.borrow_mut().take().and_then(|s| s.applied))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn video_and_audio_tool_modals_have_distinct_controls_and_params() {
+        let mut trim_vid = ModalState::new("trimVideo", vec![]);
+        assert_eq!(trim_vid.pills[0], "Full Range");
+        trim_vid.on_pill_clicked(1);
+        let pv = trim_vid.build_params();
+        assert!(pv.start_sec > 0.5 && pv.end_sec.unwrap() < trim_vid.duration);
+        assert!(!pv.trim_silence);
+
+        let mut trim_aud = ModalState::new("trimAudio", vec![]);
+        assert_eq!(trim_aud.pills[1], "Trim Silent Ends");
+        trim_aud.on_pill_clicked(1);
+        let pa = trim_aud.build_params();
+        assert!(pa.trim_silence);
+
+        let mut spd = ModalState::new("changeVideoSpeed", vec![]);
+        spd.on_pill_clicked(0);
+        assert_eq!(spd.build_params().speed_factor, 0.5);
+        spd.on_pill_clicked(4);
+        assert_eq!(spd.build_params().speed_factor, 4.0);
+
+        let mut split = ModalState::new("splitVideo", vec![]);
+        split.on_pill_clicked(2); // 3 Equal Clips -> 2 split points
+        assert_eq!(split.build_params().split_points.len(), 2);
+
+        let mut norm = ModalState::new("normalizeAudio", vec![]);
+        norm.on_pill_clicked(1); // Broadcast (-23)
+        assert_eq!(norm.build_params().target_lufs, -23.0);
+
+        let mut ch = ModalState::new("audioChannels", vec![]);
+        ch.sliders[0].val = 50.0;
+        ch.on_pill_clicked(1); // Stereo
+        let pch = ch.build_params();
+        assert!(!pch.mono && (pch.left_gain - 0.5).abs() < 0.01);
+    }
 }

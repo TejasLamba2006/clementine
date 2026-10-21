@@ -79,7 +79,12 @@ pub fn build_ffmpeg_args(inputs: &[PathBuf], op: &str, params: &ToolParams, out:
             a.push(e.to_string());
         }
     };
-    for i in inputs {
+    let ordered: Vec<&PathBuf> = if op == "joinVideos" && !params.page_order.is_empty() {
+        params.page_order.iter().filter_map(|&idx| inputs.get(idx)).collect()
+    } else {
+        inputs.iter().collect()
+    };
+    for i in &ordered {
         a.push("-i".into());
         a.push(p(i));
     }
@@ -92,7 +97,17 @@ pub fn build_ffmpeg_args(inputs: &[PathBuf], op: &str, params: &ToolParams, out:
         }),
         "removeMetadata" => a.extend(s(&["-map_metadata", "-1", "-c", "copy"])),
         "muteVideo" => a.extend(s(&["-an", "-c:v", "copy"])),
-        "trimVideo" | "trimAudio" => times(&mut a),
+        "trimVideo" => times(&mut a),
+        "trimAudio" => {
+            times(&mut a);
+            if params.trim_silence {
+                // Trim leading and trailing silence while preserving internal pauses
+                a.extend(s(&[
+                    "-af",
+                    "silenceremove=start_periods=1:start_duration=0.05:start_threshold=-42dB,areverse,silenceremove=start_periods=1:start_duration=0.05:start_threshold=-42dB,areverse",
+                ]));
+            }
+        }
         "changeVideoSpeed" => {
             let f = params.speed_factor;
             a.extend(s(&[
@@ -104,37 +119,69 @@ pub fn build_ffmpeg_args(inputs: &[PathBuf], op: &str, params: &ToolParams, out:
                 "[a]",
             ]));
         }
-        "normalizeAudio" => a.extend(s(&["-af", "loudnorm=I=-16:TP=-1.5:LRA=11"])),
-        "audioChannels" => a.extend(s(&["-ac", if params.mono { "1" } else { "2" }])),
+        "normalizeAudio" => {
+            let af = format!(
+                "loudnorm=I={}:TP={}:LRA={}",
+                params.target_lufs, params.true_peak, params.loudness_range
+            );
+            a.extend(s(&["-af", &af]));
+        }
+        "audioChannels" => {
+            let lg = params.left_gain;
+            let rg = params.right_gain;
+            if (lg - 1.0).abs() > 0.001 || (rg - 1.0).abs() > 0.001 {
+                let pan = if params.mono {
+                    format!("pan=mono|c0={:.2}*c0+{:.2}*c1", lg * 0.5, rg * 0.5)
+                } else {
+                    format!("pan=stereo|c0={lg:.2}*c0|c1={rg:.2}*c1")
+                };
+                a.extend(s(&["-af", &pan, "-ac", if params.mono { "1" } else { "2" }]));
+            } else {
+                a.extend(s(&["-ac", if params.mono { "1" } else { "2" }]));
+            }
+        }
         "cropVideo" | "redactVideo" => {
             let vf = match (op, params.crop_rect) {
                 ("cropVideo", Some((x, y, w, h))) => format!("crop={w}:{h}:{x}:{y}"),
                 ("cropVideo", None) => "crop=trunc(iw*0.8/2)*2:trunc(ih*0.8/2)*2".into(),
                 (_, Some((x, y, w, h))) => {
-                    format!("drawbox=x={x}:y={y}:w={w}:h={h}:color=black@1:t=fill")
+                    if let Some(end) = params.end_sec {
+                        let color = if params.redact_solid { "black@1" } else { "black@0.88" };
+                        format!("drawbox=x={x}:y={y}:w={w}:h={h}:color={color}:t=fill:enable='between(t,{},{end})'", params.start_sec)
+                    } else {
+                        format!("drawbox=x={x}:y={y}:w={w}:h={h}:color=black@1:t=fill")
+                    }
                 }
                 (_, None) => "drawbox=x=iw/4:y=ih/4:w=iw/2:h=ih/2:color=black@1:t=fill".into(),
             };
             a.extend(s(&["-vf", &vf, "-c:a", "copy"]));
         }
-        "audioToVideo" => a.extend(s(&[
-            "-filter_complex",
-            "[0:a]showwaves=s=1280x720:mode=cline,format=yuv420p[v]",
-            "-map",
-            "[v]",
-            "-map",
-            "0:a",
-            "-c:v",
-            "libx264",
-            "-c:a",
-            "aac",
-        ])),
+        "audioToVideo" => {
+            let sz = match params.visualizer_shape {
+                1 => "720x1280",
+                2 => "720x720",
+                _ => "1280x720",
+            };
+            let mode = if params.visualizer_bars { "p2p" } else { "cline" };
+            a.extend(s(&[
+                "-filter_complex",
+                &format!("[0:a]showwaves=s={sz}:mode={mode}:colors=0xff5200,format=yuv420p[v]"),
+                "-map",
+                "[v]",
+                "-map",
+                "0:a",
+                "-c:v",
+                "libx264",
+                "-c:a",
+                "aac",
+            ]));
+        }
         "redactAudio" => {
             let end = params.end_sec.map(|e| e.to_string()).unwrap_or_else(|| "9999999".into());
             a.extend(s(&["-af", &format!("volume=enable='between(t,{},{end})':volume=0", params.start_sec)]));
         }
         "joinVideos" => {
-            let n = inputs.len();
+            let n = ordered.len();
             let streams: String = (0..n).map(|i| format!("[{i}:v][{i}:a]")).collect();
             a.extend(s(&[
                 "-filter_complex",
@@ -146,15 +193,25 @@ pub fn build_ffmpeg_args(inputs: &[PathBuf], op: &str, params: &ToolParams, out:
             ]));
         }
         "splitVideo" => {
-            let end = params.end_sec.unwrap_or(10.0);
-            a.extend(s(&["-c", "copy", "-map", "0", "-f", "segment", "-segment_time", &end.to_string(), "-reset_timestamps", "1"]));
+            if !params.split_points.is_empty() {
+                let pts: String = params
+                    .split_points
+                    .iter()
+                    .map(|t| format!("{t:.2}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                a.extend(s(&["-c", "copy", "-map", "0", "-f", "segment", "-segment_times", &pts, "-reset_timestamps", "1"]));
+            } else {
+                let end = params.end_sec.unwrap_or(10.0);
+                a.extend(s(&["-c", "copy", "-map", "0", "-f", "segment", "-segment_time", &end.to_string(), "-reset_timestamps", "1"]));
+            }
             a.push(p(&out.join(format!("clip_%03d.{in_ext}"))));
             return a;
         }
         "videoSnapshots" => {
-            // -ss as an input option is fast; move it before the input.
+            let t = params.snapshot_times.first().copied().unwrap_or(params.start_sec);
             let at = a.iter().position(|x| x == "-i").unwrap_or(a.len());
-            a.splice(at..at, s(&["-ss", &params.start_sec.to_string()]));
+            a.splice(at..at, s(&["-ss", &t.to_string()]));
             a.extend(s(&["-frames:v", "1"]));
         }
         _ => {}
@@ -163,7 +220,7 @@ pub fn build_ffmpeg_args(inputs: &[PathBuf], op: &str, params: &ToolParams, out:
     a
 }
 
-fn find_ffmpeg() -> PathBuf {
+pub fn find_ffmpeg() -> PathBuf {
     let exe = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
@@ -180,6 +237,86 @@ fn find_ffmpeg() -> PathBuf {
         }
     }
     PathBuf::from(exe)
+}
+
+/// Probes the duration in seconds of a media file using `ffmpeg -i`.
+pub fn probe_duration_secs(path: &Path) -> f32 {
+    let mut cmd = Command::new(find_ffmpeg());
+    cmd.args(["-hide_banner", "-i"]).arg(path);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let Ok(out) = cmd.output() else { return 4.0 };
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for line in stderr.lines() {
+        if let Some(idx) = line.find("Duration:") {
+            let rest = line[idx + 9..].trim();
+            let tc = rest.split(',').next().unwrap_or("").trim();
+            let parts: Vec<&str> = tc.split(':').collect();
+            if parts.len() == 3 {
+                let h: f32 = parts[0].parse().unwrap_or(0.0);
+                let m: f32 = parts[1].parse().unwrap_or(0.0);
+                let s: f32 = parts[2].parse().unwrap_or(0.0);
+                let total = h * 3600.0 + m * 60.0 + s;
+                if total > 0.05 {
+                    return total;
+                }
+            }
+        }
+    }
+    4.0
+}
+
+/// Extracts a single video frame at `time_sec` scaled within `max_w x max_h` via `ffmpeg` image2pipe.
+pub fn extract_video_frame_rgba(path: &Path, time_sec: f32, max_w: u32, _max_h: u32) -> Option<image::RgbaImage> {
+    let mut cmd = Command::new(find_ffmpeg());
+    cmd.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-ss",
+        &format!("{:.2}", time_sec.max(0.0)),
+        "-i",
+    ])
+    .arg(path)
+    .args([
+        "-frames:v",
+        "1",
+        "-vf",
+        &format!("scale={max_w}:-1"),
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "png",
+        "-",
+    ]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() || out.stdout.is_empty() {
+        return None;
+    }
+    image::load_from_memory_with_format(&out.stdout, image::ImageFormat::Png)
+        .ok()
+        .map(|im| im.to_rgba8())
+}
+
+/// Extracts `count` evenly-spaced thumbnail frames across the video's duration for the timeline filmstrip.
+pub fn extract_video_filmstrip(path: &Path, duration: f32, count: usize, tile_w: u32, tile_h: u32) -> Vec<image::RgbaImage> {
+    let mut tiles = Vec::with_capacity(count);
+    let dur = duration.max(0.5);
+    for i in 0..count {
+        let t = ((i as f32 + 0.35) / count.max(1) as f32) * (dur - 0.1).max(0.0);
+        if let Some(fr) = extract_video_frame_rgba(path, t, tile_w * 2, tile_h * 2) {
+            tiles.push(image::imageops::resize(&fr, tile_w, tile_h, image::imageops::FilterType::Triangle));
+        }
+    }
+    tiles
 }
 
 fn run(args: &[String]) -> Result<()> {
@@ -211,6 +348,21 @@ pub fn convert(path: &Path, target: &str, out: &Path) -> Result<()> {
 }
 
 pub fn run_tool(job: &[PathBuf], tool_id: &str, params: &ToolParams, out: &Path) -> Result<()> {
+    if tool_id == "videoSnapshots" && params.snapshot_times.len() > 1 {
+        let stem = out.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Snapshot".into());
+        let parent = out.parent().unwrap_or(Path::new("."));
+        for (idx, &t) in params.snapshot_times.iter().enumerate() {
+            let mut single = params.clone();
+            single.snapshot_times = vec![t];
+            let target = if idx == 0 {
+                out.to_path_buf()
+            } else {
+                parent.join(format!("{stem} {}.png", idx + 1))
+            };
+            run(&build_ffmpeg_args(job, tool_id, &single, &target))?;
+        }
+        return Ok(());
+    }
     run(&build_ffmpeg_args(job, tool_id, params, out))
 }
 
@@ -268,6 +420,10 @@ mod tests {
         let mut want = head();
         want.extend(s(&["-i", "a.mp3", "-ss", "1.5", "-to", "4", "o.mp3"]));
         assert_eq!(args("a.mp3", "trimAudio", &p, "o.mp3"), want);
+
+        let trim_sil = ToolParams { start_sec: 0.0, end_sec: Some(5.0), trim_silence: true, ..Default::default() };
+        assert!(args("a.mp3", "trimAudio", &trim_sil, "o.mp3").join(" ").contains("silenceremove"));
+
         let open = ToolParams { start_sec: 2.0, ..Default::default() };
         assert!(!args("a.mp3", "trimAudio", &open, "o.mp3").contains(&"-to".to_string()));
 
@@ -294,6 +450,9 @@ mod tests {
         let split = args("v.mp4", "splitVideo", &d, "clips");
         assert!(split.join(" ").contains("-f segment -segment_time 10"));
         assert!(split.last().unwrap().ends_with("clip_%03d.mp4"));
+
+        let split_custom = ToolParams { split_points: vec![1.25, 2.50], ..Default::default() };
+        assert!(args("v.mp4", "splitVideo", &split_custom, "clips").join(" ").contains("-segment_times 1.25,2.50"));
 
         let snap = args("v.mp4", "videoSnapshots", &d, "o.png").join(" ");
         assert!(snap.contains("-ss 0 -i v.mp4 -frames:v 1 o.png"));

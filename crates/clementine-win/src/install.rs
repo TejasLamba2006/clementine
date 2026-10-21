@@ -113,8 +113,9 @@ pub fn install_app(quiet: bool) -> Result<PathBuf, String> {
     std::fs::create_dir_all(install_dir()).map_err(|e| e.to_string())?;
     let cur = std::env::current_exe().map_err(|e| e.to_string())?;
     if cur != target {
+        let pid_filter = format!("PID ne {}", std::process::id());
         let _ = std::process::Command::new("taskkill.exe")
-            .args(["/F", "/IM", "Clementine.exe"])
+            .args(["/F", "/IM", "Clementine.exe", "/FI", &pid_filter])
             .creation_flags(CREATE_NO_WINDOW)
             .status();
         std::thread::sleep(std::time::Duration::from_millis(120));
