@@ -293,15 +293,20 @@ fn clipboard_paths(hwnd: HWND) -> Vec<PathBuf> {
 }
 
 fn open_wheel(hwnd: HWND, mode: WheelMode, demo: bool) {
+    let is_tour = TOUR_DIR.with(|d| d.borrow().is_some());
+    if !demo && !is_tour && drop_target::is_cursor_over_clementine_web_demo() {
+        return;
+    }
     let mut pt = POINT { x: 0, y: 0 };
     unsafe { GetCursorPos(&mut pt) };
     let mut initial_paths = PATHS.lock().unwrap().clone();
-    if initial_paths.is_empty() && !demo && TOUR_DIR.with(|d| d.borrow().is_none()) {
+    if initial_paths.is_empty() && !demo && !is_tour {
         initial_paths = drop_target::query_active_explorer_selection();
     }
-    if initial_paths.is_empty() {
+    if initial_paths.is_empty() && (demo || is_tour) {
         initial_paths = clipboard_paths(hwnd);
     }
+    let already_open = W.with(|c| c.borrow().as_ref().is_some_and(|w| w.open));
     hook::set_wheel_open(true);
     let (was_open, cx, cy) = W.with(|c| {
         let mut g = c.borrow_mut();
@@ -335,6 +340,13 @@ fn open_wheel(hwnd: HWND, mode: WheelMode, demo: bool) {
             // Nudge so an in-flight DoDragDrop fires DragEnter without waiting for real movement.
             SetCursorPos(pt.x + 1, pt.y);
             SetCursorPos(pt.x, pt.y);
+            // If this was not a real file drag (e.g. text selection or webpage drag with no CF_HDROP), auto-dismiss after 90ms
+            if !demo && !is_tour && !already_open {
+                let has_files = W.with(|c| c.borrow().as_ref().is_some_and(|w| !w.paths.is_empty()));
+                if !has_files {
+                    SetTimer(hwnd, TIMER_CLOSE_ID, 90, None);
+                }
+            }
         } else {
             present_hwnd(hwnd);
         }
@@ -529,9 +541,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM) -
             0
         }
         WM_APP_ENTER => {
+            let p = PATHS.lock().unwrap().clone();
+            if p.is_empty() {
+                // Dragging non-file content (e.g. webpage DOM element or selected text) -> close native wheel
+                close_wheel(hwnd);
+                return 0;
+            }
+            KillTimer(hwnd, TIMER_CLOSE_ID);
             let open = W.with(|c| {
                 if let Some(w) = c.borrow_mut().as_mut() {
-                    w.paths = PATHS.lock().unwrap().clone();
+                    w.paths = p;
                     if w.open {
                         refresh_targets(w);
                         return true;

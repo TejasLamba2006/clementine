@@ -6,12 +6,15 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Mutex;
 use windows_sys::core::{GUID, HRESULT};
-use windows_sys::Win32::Foundation::{HWND, POINTL, S_OK};
+use windows_sys::Win32::Foundation::{HWND, POINT, POINTL, S_OK};
 use windows_sys::Win32::System::Com::{FORMATETC, STGMEDIUM};
 use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
 use windows_sys::Win32::System::Ole::*;
 use windows_sys::Win32::UI::Shell::{DragQueryFileW, HDROP};
-use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow, GetWindowTextW, PostMessageW,
+    WindowFromPoint, GA_ROOT, WM_APP,
+};
 
 pub const WM_APP_ENTER: u32 = WM_APP + 10;
 pub const WM_APP_OVER: u32 = WM_APP + 11;
@@ -158,12 +161,75 @@ unsafe fn read_paths(data: *mut c_void) -> Vec<PathBuf> {
     out
 }
 
+fn class_name(hwnd: HWND) -> String {
+    if hwnd.is_null() {
+        return String::new();
+    }
+    let mut buf = [0u16; 256];
+    let n = unsafe { GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) as usize };
+    String::from_utf16_lossy(&buf[..n])
+}
+
+fn window_title(hwnd: HWND) -> String {
+    if hwnd.is_null() {
+        return String::new();
+    }
+    let mut buf = [0u16; 512];
+    let n = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) as usize };
+    String::from_utf16_lossy(&buf[..n])
+}
+
+/// Returns `true` when the user is dragging inside the Clementine web playground
+/// in a browser so the native desktop wheel does not double-open on top of the web demo.
+pub fn is_cursor_over_clementine_web_demo() -> bool {
+    let fg = unsafe { GetForegroundWindow() };
+    let title = window_title(fg).to_ascii_lowercase();
+    title.contains("clementine |")
+        || title.contains("zero-click offline file converter")
+        || title.contains("tejaslamba2006.github.io/clementine")
+}
+
+/// Returns `true` when the cursor or active foreground window is Windows File Explorer or the Desktop.
+pub fn is_explorer_or_desktop_active() -> bool {
+    let is_shell_cls = |cls: &str| {
+        matches!(
+            cls,
+            "CabinetWClass"
+                | "ExploreWClass"
+                | "Progman"
+                | "WorkerW"
+                | "DirectUIHWND"
+                | "SHELLDLL_DefView"
+                | "SysListView32"
+        )
+    };
+    let fg = unsafe { GetForegroundWindow() };
+    if is_shell_cls(&class_name(fg)) {
+        return true;
+    }
+    let mut pt = POINT { x: 0, y: 0 };
+    unsafe { GetCursorPos(&mut pt) };
+    let at = unsafe { WindowFromPoint(pt) };
+    if is_shell_cls(&class_name(at)) {
+        return true;
+    }
+    let root = unsafe { GetAncestor(at, GA_ROOT) };
+    is_shell_cls(&class_name(root))
+}
+
 /// Queries the currently selected/focused item(s) in the active File Explorer window via Shell.Application COM.
 pub fn query_active_explorer_selection() -> Vec<PathBuf> {
+    if !is_explorer_or_desktop_active() {
+        return vec![];
+    }
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let script = r#"$sh = New-Object -ComObject Shell.Application; foreach ($w in $sh.Windows()) { try { $sel = $w.Document.SelectedItems(); if ($sel -and $sel.Count -gt 0) { foreach ($i in $sel) { Write-Output $i.Path }; exit } $f = $w.Document.FocusedItem; if ($f -and $f.Path) { Write-Output $f.Path; exit } } catch {} }"#;
+    let fg = unsafe { GetForegroundWindow() } as usize;
+    let script = format!(
+        r#"$fg = {}; $sh = New-Object -ComObject Shell.Application; foreach ($w in $sh.Windows()) {{ try {{ if ([uintptr]$w.HWND -eq [uintptr]$fg) {{ $sel = $w.Document.SelectedItems(); if ($sel -and $sel.Count -gt 0) {{ foreach ($i in $sel) {{ Write-Output $i.Path }}; exit }} $f = $w.Document.FocusedItem; if ($f -and $f.Path) {{ Write-Output $f.Path; exit }} }} }} catch {{}} }}; foreach ($w in $sh.Windows()) {{ try {{ $sel = $w.Document.SelectedItems(); if ($sel -and $sel.Count -gt 0) {{ foreach ($i in $sel) {{ Write-Output $i.Path }}; exit }} }} catch {{}} }}"#,
+        fg
+    );
     let Ok(out) = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", script])
+        .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
     else {
