@@ -902,6 +902,7 @@ fn tour_tick(hwnd: HWND) {
             10 => {
                 unsafe {
                     KillTimer(hwnd, TIMER_TOUR_ID);
+                    KillTimer(hwnd, TIMER_REC_ID);
                     ShowWindow(hwnd, SW_HIDE);
                 }
                 let src = dir.join("mountain-sunset.jpg");
@@ -918,12 +919,16 @@ fn tour_tick(hwnd: HWND) {
                         });
                     }
                 }
-                unsafe { SetTimer(hwnd, TIMER_TOUR_ID, 350, None) };
+                unsafe {
+                    SetTimer(hwnd, TIMER_REC_ID, 40, None);
+                    SetTimer(hwnd, TIMER_TOUR_ID, 350, None);
+                };
             }
             11..=13 => {}
             14 => {
                 unsafe {
                     KillTimer(hwnd, TIMER_TOUR_ID);
+                    KillTimer(hwnd, TIMER_REC_ID);
                     ShowWindow(hwnd, SW_HIDE);
                 }
                 let src = dir.join("alpine-lake.jpg");
@@ -940,7 +945,10 @@ fn tour_tick(hwnd: HWND) {
                         });
                     }
                 }
-                unsafe { SetTimer(hwnd, TIMER_TOUR_ID, 350, None) };
+                unsafe {
+                    SetTimer(hwnd, TIMER_REC_ID, 40, None);
+                    SetTimer(hwnd, TIMER_TOUR_ID, 350, None);
+                };
             }
             15..=17 => {}
             18..=20 => {

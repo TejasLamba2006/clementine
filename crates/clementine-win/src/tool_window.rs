@@ -1596,7 +1596,7 @@ unsafe extern "system" fn modal_proc(hwnd: HWND, m: u32, wp: WPARAM, lp: LPARAM)
                 SetCursorPos(cx, cy);
             }
             present_modal(hwnd);
-            crate::record_real_desktop_frame(1.16);
+            crate::record_real_desktop_frame(1.12);
             if should_apply {
                 KillTimer(hwnd, TIMER_AUTO_ID);
                 DestroyWindow(hwnd);
