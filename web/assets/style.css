@@ -34,3 +34,6 @@
 @media(max-width:860px){.win-native{grid-template-columns:1fr}.win-pillars{grid-template-columns:1fr}}
 
 
+
+.award-pill{display:inline-flex;align-items:center;gap:6px;padding:6px 14px;margin-bottom:14px;border-radius:999px;background:rgba(255,82,0,.1);border:1px solid rgba(255,82,0,.35);color:#d94600;font:600 13px/1.2 "DM Sans",system-ui,sans-serif;text-decoration:none;transition:transform .15s,background .15s}
+.award-pill:hover{background:rgba(255,82,0,.16);transform:translateY(-1px)}

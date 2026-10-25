@@ -12,6 +12,12 @@
   <a href="https://github.com/TejasLamba2006/clementine/releases/latest"><strong>Portable EXE & Releases</strong></a>
 </p>
 
+<p align="center">
+  <a href="https://www.linkedin.com/posts/todays-100-winner-of-no-hands-the-wispr-ugcPost-7519892144413929474-lfGr/">
+    <strong>🏆 Winner ($100 Prize) · WeMakeDevs x Wispr Flow Challenge ("No Hands: The Wispr Challenge")</strong>
+  </a>
+</p>
+
 ---
 
 ## Live Desktop Captures (Windows 11)
